@@ -263,15 +263,23 @@ def calculate_lead_metrics(df):
         metrics["conversion_rate_simple"] = 0
     
     # Conversion rate (adjusted) - excludes capacity constraints and non-engagements
-    # Denominator = Total - Full - We turn down - Cold (capacity/non-engagement issues)
+    # Exclude: Full, We turn down, Cold ONLY when "Never acknowledged"
+    cold_never_acknowledged = len(df_2026[
+        (df_2026["Resolution"] == "Cold") & 
+        (df_2026["Level of interaction"] == "Never acknowledged")
+    ])
+    
     adjusted_denominator = (metrics["total_inquiries"] 
                            - metrics["full"] 
                            - metrics["we_turn_down"]
-                           - metrics["cold"])
+                           - cold_never_acknowledged)
     if adjusted_denominator > 0:
         metrics["conversion_rate"] = metrics["booked"] / adjusted_denominator * 100
     else:
         metrics["conversion_rate"] = 0
+    
+    # Store for display
+    metrics["cold_never_acknowledged"] = cold_never_acknowledged
     
     # Lead time calculations (Event Date - Inquiry Date)
     lead_times_by_resolution = {}
@@ -472,7 +480,7 @@ def main():
             conversion_simple = metrics.get("conversion_rate_simple", 0)
             
             st.metric("Conversion Rate", f"{conversion:.0f}%")
-            st.caption(f"Adjusted: excludes Full/Cold/Turn-away")
+            st.caption(f"Excludes: Full, Turn-away, Cold (no response)")
             st.caption(f"Simple (all inquiries): {conversion_simple:.0f}%")
             
             # Show by source
