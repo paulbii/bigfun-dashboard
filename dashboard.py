@@ -1,0 +1,539 @@
+"""
+Big Fun DJ Operations Dashboard
+A read-only status board showing booking pace, lead metrics, and capacity.
+"""
+
+import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
+import pandas as pd
+from datetime import datetime, timedelta
+import requests
+from functools import lru_cache
+import time
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+BOOKING_SNAPSHOTS_SHEET_ID = "1JV5S1hbtYcXhVoeqsYVw_nhUvRoOlSBt5BYZ0ffxFkU"
+INQUIRY_TRACKER_SHEET_ID = "1ng-OytB9LJ8Fmfazju4cfFJRRa6bqfRIZA8GYEWhJRs"
+AVAILABILITY_MATRIX_SHEET_ID = "1lXwHECkQJy7h87L5oKbo0hDTpalDgKFTbBQJ4pIerFo"
+
+FILEMAKER_BASE_URL = "https://database.bigfundj.com/bigfunadmin"
+
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# =============================================================================
+# AUTHENTICATION
+# =============================================================================
+
+@st.cache_resource
+def get_google_client():
+    """Initialize Google Sheets client with service account credentials."""
+    try:
+        # Try Streamlit Cloud secrets first
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    except (KeyError, FileNotFoundError):
+        # Fall back to local credentials file
+        creds = Credentials.from_service_account_file(
+            "your-credentials.json", scopes=SCOPES
+        )
+    return gspread.authorize(creds)
+
+
+# =============================================================================
+# DATA FETCHING
+# =============================================================================
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_year_comparison_data():
+    """Fetch YoY booking comparison from Booking Snapshots sheet."""
+    client = get_google_client()
+    sheet = client.open_by_key(BOOKING_SNAPSHOTS_SHEET_ID)
+    worksheet = sheet.worksheet("Year Comparison")
+    data = worksheet.get_all_records()
+    return pd.DataFrame(data)
+
+
+@st.cache_data(ttl=300)
+def get_inquiry_tracker_data():
+    """Fetch all inquiry data from the Inquiry Tracker sheet."""
+    client = get_google_client()
+    sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
+    worksheet = sheet.worksheet("Master View")
+    data = worksheet.get_all_records()
+    return pd.DataFrame(data)
+
+
+@st.cache_data(ttl=300)
+def get_upcoming_events(days_ahead=14):
+    """Fetch upcoming events from FileMaker gig database."""
+    today = datetime.now()
+    events = []
+    
+    # Query FileMaker for multiple days using the multi-day endpoint
+    for offset in range(0, days_ahead, 7):  # Query in weekly chunks
+        query_date = today + timedelta(days=offset)
+        date_str = query_date.strftime("%-m/%-d/%Y")
+        
+        try:
+            url = f"{FILEMAKER_BASE_URL}/availabilityMDjson.php?date={date_str}"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list):
+                    events.extend(data)
+        except Exception as e:
+            st.warning(f"Could not fetch events for {date_str}: {e}")
+    
+    # Deduplicate and filter to date range
+    seen = set()
+    unique_events = []
+    end_date = today + timedelta(days=days_ahead)
+    
+    for event in events:
+        event_key = (event.get("event_date"), event.get("venue_name"), event.get("client_name"))
+        if event_key not in seen:
+            seen.add(event_key)
+            # Parse event date and filter
+            try:
+                event_date = datetime.strptime(event.get("event_date", ""), "%Y-%m-%d")
+                if today.date() <= event_date.date() <= end_date.date():
+                    unique_events.append(event)
+            except ValueError:
+                pass
+    
+    # Sort by date
+    unique_events.sort(key=lambda x: x.get("event_date", ""))
+    return unique_events
+
+
+# =============================================================================
+# DATA PROCESSING
+# =============================================================================
+
+def calculate_booking_pace(df):
+    """Calculate current booking pace vs last year."""
+    today = datetime.now()
+    current_day = today.strftime("%b %-d")  # e.g., "Feb 3"
+    
+    # Find the row for today (or closest)
+    # The Day column format is "Jan 1", "Jan 2", etc.
+    df_copy = df.copy()
+    
+    # Get current year and last year columns
+    current_year = str(today.year)
+    last_year = str(today.year - 1)
+    
+    # Find today's row
+    today_row = None
+    for idx, row in df_copy.iterrows():
+        day_str = str(row.get("Day", ""))
+        # Parse the day string
+        try:
+            parsed = datetime.strptime(f"{day_str} {today.year}", "%b %d %Y")
+            if parsed.date() == today.date():
+                today_row = row
+                break
+            elif parsed.date() < today.date():
+                today_row = row  # Keep last valid row before today
+        except ValueError:
+            continue
+    
+    if today_row is None:
+        return None, None, None
+    
+    current_count = today_row.get(current_year, 0)
+    last_year_count = today_row.get(last_year, 0)
+    
+    # Handle empty or non-numeric values
+    try:
+        current_count = int(current_count) if current_count else 0
+        last_year_count = int(last_year_count) if last_year_count else 0
+    except (ValueError, TypeError):
+        current_count = 0
+        last_year_count = 0
+    
+    diff = current_count - last_year_count
+    
+    return current_count, last_year_count, diff
+
+
+def calculate_lead_metrics(df):
+    """Calculate lead time and conversion metrics for 2026 entries."""
+    # Filter for 2026 entries with Inquiry Date populated
+    df_2026 = df[df["Timestamp"].astype(str).str.contains("2026", na=False)].copy()
+    
+    # Filter for rows with Inquiry Date
+    df_with_dates = df_2026[df_2026["Inquiry Date"].astype(str).str.strip() != ""].copy()
+    
+    if df_with_dates.empty:
+        return {}
+    
+    metrics = {}
+    
+    # Total counts by resolution
+    resolution_counts = df_2026["Resolution"].value_counts().to_dict()
+    metrics["total_inquiries"] = len(df_2026)
+    metrics["booked"] = resolution_counts.get("Booked", 0)
+    metrics["didnt_book"] = resolution_counts.get("Didn't Book", 0)
+    metrics["full"] = resolution_counts.get("Full", 0)
+    metrics["cold"] = resolution_counts.get("Cold", 0)
+    metrics["we_turn_down"] = resolution_counts.get("We turn down", 0)
+    metrics["canceled"] = resolution_counts.get("Canceled", 0)
+    
+    # Conversion rate
+    if metrics["total_inquiries"] > 0:
+        metrics["conversion_rate"] = metrics["booked"] / metrics["total_inquiries"] * 100
+    else:
+        metrics["conversion_rate"] = 0
+    
+    # Lead time calculations (Event Date - Inquiry Date)
+    lead_times_by_resolution = {}
+    days_to_decision_by_resolution = {}
+    
+    for _, row in df_with_dates.iterrows():
+        resolution = row["Resolution"]
+        
+        # Calculate lead time (Event Date - Inquiry Date)
+        try:
+            event_date = pd.to_datetime(row["Event Date"], format="%m/%d/%y", errors="coerce")
+            if pd.isna(event_date):
+                event_date = pd.to_datetime(row["Event Date"], errors="coerce")
+            
+            inquiry_date = pd.to_datetime(row["Inquiry Date"], errors="coerce")
+            
+            if pd.notna(event_date) and pd.notna(inquiry_date):
+                lead_time_days = (event_date - inquiry_date).days
+                if lead_time_days >= 0:  # Sanity check
+                    if resolution not in lead_times_by_resolution:
+                        lead_times_by_resolution[resolution] = []
+                    lead_times_by_resolution[resolution].append(lead_time_days)
+        except Exception:
+            pass
+        
+        # Calculate days to decision (Decision Date - Inquiry Date)
+        try:
+            decision_date = pd.to_datetime(row["Decision Date"], errors="coerce")
+            inquiry_date = pd.to_datetime(row["Inquiry Date"], errors="coerce")
+            
+            if pd.notna(decision_date) and pd.notna(inquiry_date):
+                days_to_decision = (decision_date - inquiry_date).days
+                if days_to_decision >= 0:
+                    if resolution not in days_to_decision_by_resolution:
+                        days_to_decision_by_resolution[resolution] = []
+                    days_to_decision_by_resolution[resolution].append(days_to_decision)
+        except Exception:
+            pass
+    
+    # Calculate averages
+    metrics["lead_times"] = {}
+    for resolution, times in lead_times_by_resolution.items():
+        if times:
+            avg_days = sum(times) / len(times)
+            metrics["lead_times"][resolution] = {
+                "avg_days": avg_days,
+                "avg_months": avg_days / 30.44,
+                "count": len(times)
+            }
+    
+    metrics["days_to_decision"] = {}
+    for resolution, times in days_to_decision_by_resolution.items():
+        if times:
+            metrics["days_to_decision"][resolution] = {
+                "avg_days": sum(times) / len(times),
+                "median_days": sorted(times)[len(times) // 2],
+                "count": len(times)
+            }
+    
+    # Conversion by source
+    source_counts = df_2026.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
+    metrics["by_source"] = {}
+    for source in source_counts.index:
+        total = source_counts.loc[source].sum()
+        booked = source_counts.loc[source].get("Booked", 0)
+        if total > 0:
+            metrics["by_source"][source] = {
+                "total": total,
+                "booked": booked,
+                "conversion_rate": booked / total * 100
+            }
+    
+    # Level of interaction analysis
+    interaction_counts = df_2026.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
+    metrics["by_interaction"] = {}
+    for interaction in interaction_counts.index:
+        total = interaction_counts.loc[interaction].sum()
+        booked = interaction_counts.loc[interaction].get("Booked", 0)
+        if total > 0:
+            metrics["by_interaction"][interaction] = {
+                "total": total,
+                "booked": booked,
+                "conversion_rate": booked / total * 100
+            }
+    
+    return metrics
+
+
+def get_dj_initials(dj_name):
+    """Convert DJ full name to initials."""
+    if not dj_name or dj_name == "Unassigned":
+        return "TBA"
+    
+    name_lower = dj_name.lower()
+    if "henry" in name_lower:
+        return "HK"
+    elif "woody" in name_lower:
+        return "WM"
+    elif "paul" in name_lower:
+        return "PB"
+    elif "stefano" in name_lower:
+        return "SB"
+    elif "felipe" in name_lower:
+        return "FS"
+    elif "stephanie" in name_lower:
+        return "SD"
+    return "??"
+
+
+# =============================================================================
+# DASHBOARD UI
+# =============================================================================
+
+def main():
+    st.set_page_config(
+        page_title="Big Fun DJ Operations",
+        page_icon="🎧",
+        layout="wide",
+    )
+    
+    st.title("🎧 Big Fun DJ Operations")
+    st.caption(f"Last refreshed: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}")
+    
+    # Add refresh button
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 1: Booking Pace + Lead Metrics Summary
+    # ==========================================================================
+    
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    # Booking Pace
+    with col1:
+        st.subheader("📈 Booking Pace")
+        try:
+            yoy_df = get_year_comparison_data()
+            current, last_year, diff = calculate_booking_pace(yoy_df)
+            
+            if current is not None:
+                st.metric(
+                    label=f"2026 Booked (as of today)",
+                    value=current,
+                    delta=f"{diff:+d} vs 2025" if diff else None,
+                    delta_color="normal"
+                )
+                st.caption(f"Same time 2025: {last_year}")
+            else:
+                st.info("No pace data available")
+        except Exception as e:
+            st.error(f"Could not load booking pace: {e}")
+    
+    # Lead Metrics Summary
+    with col2:
+        st.subheader("📊 2026 Inquiries")
+        try:
+            inquiry_df = get_inquiry_tracker_data()
+            metrics = calculate_lead_metrics(inquiry_df)
+            
+            if metrics:
+                st.metric("Total Inquiries", metrics.get("total_inquiries", 0))
+                
+                sub_col1, sub_col2 = st.columns(2)
+                with sub_col1:
+                    st.metric("Booked", metrics.get("booked", 0))
+                    st.metric("Didn't Book", metrics.get("didnt_book", 0))
+                with sub_col2:
+                    st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
+                    st.metric("Cold/Ghosted", metrics.get("cold", 0))
+            else:
+                st.info("No inquiry data available")
+        except Exception as e:
+            st.error(f"Could not load inquiry metrics: {e}")
+    
+    # Conversion Rate
+    with col3:
+        st.subheader("🎯 Conversion")
+        try:
+            if metrics:
+                conversion = metrics.get("conversion_rate", 0)
+                st.metric("Conversion Rate", f"{conversion:.0f}%")
+                
+                # Show by source
+                st.caption("By Lead Source:")
+                by_source = metrics.get("by_source", {})
+                for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
+                    if data["total"] >= 3:  # Only show sources with meaningful volume
+                        st.text(f"  {source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
+        except Exception as e:
+            st.error(f"Could not load conversion data: {e}")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 2: Upcoming Events
+    # ==========================================================================
+    
+    st.subheader("📅 Upcoming Events (Next 14 Days)")
+    
+    try:
+        events = get_upcoming_events(14)
+        
+        if events:
+            # Group by date
+            events_by_date = {}
+            for event in events:
+                date = event.get("event_date", "Unknown")
+                if date not in events_by_date:
+                    events_by_date[date] = []
+                events_by_date[date].append(event)
+            
+            # Display in columns
+            cols = st.columns(min(len(events_by_date), 4))
+            
+            for idx, (date, day_events) in enumerate(sorted(events_by_date.items())):
+                col_idx = idx % 4
+                with cols[col_idx]:
+                    # Format date
+                    try:
+                        dt = datetime.strptime(date, "%Y-%m-%d")
+                        formatted_date = dt.strftime("%a %b %-d")
+                    except ValueError:
+                        formatted_date = date
+                    
+                    st.markdown(f"**{formatted_date}**")
+                    
+                    for event in day_events:
+                        dj = event.get("assigned_dj", "TBA")
+                        initials = get_dj_initials(dj)
+                        venue = event.get("venue_name", "Unknown venue")
+                        # Truncate venue name
+                        if len(venue) > 20:
+                            venue = venue[:17] + "..."
+                        
+                        st.text(f"[{initials}] {venue}")
+                    st.text("")  # Spacer
+        else:
+            st.info("No upcoming events found")
+    except Exception as e:
+        st.error(f"Could not load upcoming events: {e}")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 3: Lead Time Analysis
+    # ==========================================================================
+    
+    st.subheader("⏱️ Lead Time Analysis (2026)")
+    
+    try:
+        if metrics and metrics.get("lead_times"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Average Lead Time by Outcome**")
+                lead_times = metrics.get("lead_times", {})
+                
+                # Create a simple table
+                lt_data = []
+                for resolution, data in lead_times.items():
+                    lt_data.append({
+                        "Outcome": resolution,
+                        "Avg Lead Time": f"{data['avg_months']:.1f} months",
+                        "Count": data["count"]
+                    })
+                
+                if lt_data:
+                    lt_df = pd.DataFrame(lt_data)
+                    lt_df = lt_df.sort_values("Count", ascending=False)
+                    st.dataframe(lt_df, hide_index=True, use_container_width=True)
+            
+            with col2:
+                st.markdown("**Days to Decision by Outcome**")
+                days_to_dec = metrics.get("days_to_decision", {})
+                
+                dtd_data = []
+                for resolution, data in days_to_dec.items():
+                    dtd_data.append({
+                        "Outcome": resolution,
+                        "Avg Days": f"{data['avg_days']:.0f}",
+                        "Median Days": f"{data['median_days']:.0f}",
+                        "Count": data["count"]
+                    })
+                
+                if dtd_data:
+                    dtd_df = pd.DataFrame(dtd_data)
+                    dtd_df = dtd_df.sort_values("Count", ascending=False)
+                    st.dataframe(dtd_df, hide_index=True, use_container_width=True)
+        else:
+            st.info("Lead time data requires Inquiry Date field (2026 entries)")
+    except Exception as e:
+        st.error(f"Could not calculate lead times: {e}")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 4: Conversion by Interaction Level
+    # ==========================================================================
+    
+    st.subheader("📞 Conversion by Interaction Level")
+    
+    try:
+        if metrics and metrics.get("by_interaction"):
+            by_interaction = metrics.get("by_interaction", {})
+            
+            # Order by typical sales funnel
+            interaction_order = [
+                "Never acknowledged",
+                "Only acknowledged",
+                "Meaningful email interaction",
+                "Had phone call/video chat"
+            ]
+            
+            cols = st.columns(len(interaction_order))
+            
+            for idx, interaction in enumerate(interaction_order):
+                if interaction in by_interaction:
+                    data = by_interaction[interaction]
+                    with cols[idx]:
+                        # Shorten label for display
+                        short_label = interaction.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
+                        st.metric(
+                            label=short_label,
+                            value=f"{data['conversion_rate']:.0f}%",
+                            help=f"{data['booked']} booked / {data['total']} total"
+                        )
+    except Exception as e:
+        st.error(f"Could not load interaction data: {e}")
+    
+    # ==========================================================================
+    # Footer
+    # ==========================================================================
+    
+    st.divider()
+    st.caption("Big Fun DJ Operations Dashboard • Data refreshes every 5 minutes • Click 🔄 to force refresh")
+
+
+if __name__ == "__main__":
+    main()
