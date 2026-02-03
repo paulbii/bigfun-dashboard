@@ -20,7 +20,12 @@ BOOKING_SNAPSHOTS_SHEET_ID = "1JV5S1hbtYcXhVoeqsYVw_nhUvRoOlSBt5BYZ0ffxFkU"
 INQUIRY_TRACKER_SHEET_ID = "1ng-OytB9LJ8Fmfazju4cfFJRRa6bqfRIZA8GYEWhJRs"
 AVAILABILITY_MATRIX_SHEET_ID = "1lXwHECkQJy7h87L5oKbo0hDTpalDgKFTbBQJ4pIerFo"
 
-FILEMAKER_BASE_URL = "https://database.bigfundj.com/bigfunadmin"
+# FileMaker URL loaded from secrets (not in public repo)
+def get_filemaker_url():
+    try:
+        return st.secrets["filemaker"]["base_url"]
+    except (KeyError, FileNotFoundError):
+        return ""  # Will fail gracefully if not configured
 
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -75,6 +80,10 @@ def get_inquiry_tracker_data():
 @st.cache_data(ttl=300)
 def get_upcoming_events(days_ahead=14):
     """Fetch upcoming events from FileMaker gig database."""
+    filemaker_url = get_filemaker_url()
+    if not filemaker_url:
+        return []  # Skip if FileMaker URL not configured
+    
     today = datetime.now()
     events = []
     
@@ -84,7 +93,7 @@ def get_upcoming_events(days_ahead=14):
         date_str = query_date.strftime("%-m/%-d/%Y")
         
         try:
-            url = f"{FILEMAKER_BASE_URL}/availabilityMDjson.php?date={date_str}"
+            url = f"{filemaker_url}/availabilityMDjson.php?date={date_str}"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
                 data = response.json()
