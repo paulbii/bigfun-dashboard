@@ -109,6 +109,22 @@ def get_inquiry_tracker_data():
     
     # Create DataFrame with remaining rows
     df = pd.DataFrame(all_values[1:], columns=unique_headers)
+    
+    # Deduplicate by (Event Date, Venue), keeping newest Timestamp
+    # This handles cases where an inquiry was closed (e.g., Cold) then reopened and booked
+    if "Timestamp" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
+        # Parse timestamp for sorting
+        df["_parsed_timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        
+        # Sort by timestamp descending (newest first)
+        df = df.sort_values("_parsed_timestamp", ascending=False)
+        
+        # Keep first (newest) entry for each Event Date + Venue combination
+        df = df.drop_duplicates(subset=["Event Date", "Venue (if known)"], keep="first")
+        
+        # Clean up temp column
+        df = df.drop(columns=["_parsed_timestamp"])
+    
     return df
 
 
