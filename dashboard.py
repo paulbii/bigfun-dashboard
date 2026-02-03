@@ -184,8 +184,13 @@ def calculate_booking_pace(df):
         return None, None, None, f"Column '{current_year}' not found. Available: {list(df.columns)[:10]}"
     
     # Find today's row by matching the Day column
-    # Format: "Feb 3" (no leading zero) - use lstrip to handle both
-    today_month_day = today.strftime("%b %d").replace(" 0", " ").strip()  # "Feb 3" not "Feb 03"
+    # Sheet format: "mmm d" → "Feb 3" (no leading zero)
+    # Use %-d for no leading zero on Mac/Linux
+    try:
+        today_month_day = today.strftime("%b %-d")  # "Feb 3"
+    except ValueError:
+        # Windows doesn't support %-d, fall back to manual
+        today_month_day = today.strftime("%b %d").lstrip("0").replace(" 0", " ")
     
     today_row = None
     for idx, row in df.iterrows():
