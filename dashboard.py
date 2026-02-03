@@ -123,7 +123,8 @@ def get_upcoming_events(days_ahead=14):
     events = []
     
     # Query FileMaker for multiple days using the multi-day endpoint
-    for offset in range(0, days_ahead, 7):  # Query in weekly chunks
+    # Endpoint returns ±3 days (7 day window), step by 6 to ensure overlap
+    for offset in range(0, days_ahead + 4, 6):  # +4 ensures we capture the end
         query_date = today + timedelta(days=offset)
         # Format date without leading zeros (works on all platforms)
         date_str = f"{query_date.month}/{query_date.day}/{query_date.year}"
@@ -338,6 +339,118 @@ def create_booking_pace_chart(df, days=30):
             showgrid=False,
             tickangle=-45,
             dtick=7  # Show every 7th label
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='rgba(255,255,255,0.1)'
+        ),
+        hovermode='x unified'
+    )
+    
+    return fig
+
+
+def create_booking_pace_chart_ytd(df):
+    """Create a YTD line chart comparing booking pace YoY (weekly data points)."""
+    today = datetime.now()
+    current_year = today.year
+    last_year = current_year - 1
+    
+    # Find column names
+    current_col = None
+    last_col = None
+    for col in df.columns:
+        if str(col) == str(current_year):
+            current_col = col
+        if str(col) == str(last_year):
+            last_col = col
+    
+    if current_col is None:
+        return None
+    
+    # Build weekly data points from Jan 1 to today
+    chart_data = []
+    
+    for idx, row in df.iterrows():
+        day_str = str(row.get("Day", "")).strip()
+        current_val = row.get(current_col, "")
+        last_val = row.get(last_col, "") if last_col else ""
+        
+        # Skip rows without current year data
+        if current_val == "" or current_val is None or current_val == 0:
+            continue
+        
+        try:
+            normalized = " ".join(day_str.split())
+            parsed = datetime.strptime(f"{normalized} {current_year}", "%b %d %Y")
+            
+            # Only include dates from Jan 1 to today
+            if parsed.date() <= today.date():
+                # Check if this is approximately a Monday (or first/last of visible range)
+                is_monday = parsed.weekday() == 0
+                is_first = parsed.month == 1 and parsed.day <= 3
+                is_latest = (today.date() - parsed.date()).days <= 1
+                
+                if is_monday or is_first or is_latest:
+                    chart_data.append({
+                        "date": parsed,
+                        "day_str": day_str,
+                        str(current_year): int(current_val) if current_val else 0,
+                        str(last_year): int(last_val) if last_val else 0
+                    })
+        except (ValueError, TypeError):
+            continue
+    
+    if not chart_data:
+        return None
+    
+    # Sort by date
+    chart_data.sort(key=lambda x: x["date"])
+    
+    # Create Plotly figure
+    fig = go.Figure()
+    
+    dates = [d["day_str"] for d in chart_data]
+    current_values = [d[str(current_year)] for d in chart_data]
+    last_values = [d[str(last_year)] for d in chart_data]
+    
+    # Current year line
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=current_values,
+        mode='lines+markers',
+        name=str(current_year),
+        line=dict(color='#00D4AA', width=3),
+        marker=dict(size=6)
+    ))
+    
+    # Last year line
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=last_values,
+        mode='lines+markers',
+        name=str(last_year),
+        line=dict(color='#888888', width=2, dash='dot'),
+        marker=dict(size=4)
+    ))
+    
+    # Style the chart
+    fig.update_layout(
+        height=200,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#FFFFFF'),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        xaxis=dict(
+            showgrid=False,
+            tickangle=-45
         ),
         yaxis=dict(
             showgrid=True,
@@ -614,14 +727,24 @@ def main():
         else:
             st.info("No conversion data available")
     
-    # Booking Pace Chart (full width)
+    # Booking Pace Charts
     try:
         if yoy_df is not None and not yoy_df.empty:
-            chart = create_booking_pace_chart(yoy_df, days=30)
-            if chart:
-                st.plotly_chart(chart, use_container_width=True)
+            chart_col1, chart_col2 = st.columns(2)
+            
+            with chart_col1:
+                st.caption("**Year to Date (weekly)**")
+                ytd_chart = create_booking_pace_chart_ytd(yoy_df)
+                if ytd_chart:
+                    st.plotly_chart(ytd_chart, use_container_width=True)
+            
+            with chart_col2:
+                st.caption("**Last 30 Days (daily)**")
+                daily_chart = create_booking_pace_chart(yoy_df, days=30)
+                if daily_chart:
+                    st.plotly_chart(daily_chart, use_container_width=True)
     except Exception as e:
-        st.caption(f"Could not load pace chart: {str(e)[:50]}")
+        st.caption(f"Could not load pace charts: {str(e)[:50]}")
     
     st.divider()
     
