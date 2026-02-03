@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import requests
 from functools import lru_cache
 import time
+import plotly.graph_objects as go
 
 # =============================================================================
 # CONFIGURATION
@@ -240,6 +241,114 @@ def calculate_booking_pace(df):
     return current_count, last_year_count, diff, None
 
 
+def create_booking_pace_chart(df, days=30):
+    """Create a line chart comparing booking pace YoY for the last N days."""
+    today = datetime.now()
+    current_year = today.year
+    last_year = current_year - 1
+    
+    # Find column names
+    current_col = None
+    last_col = None
+    for col in df.columns:
+        if str(col) == str(current_year):
+            current_col = col
+        if str(col) == str(last_year):
+            last_col = col
+    
+    if current_col is None:
+        return None
+    
+    # Build data for last N days
+    chart_data = []
+    
+    for idx, row in df.iterrows():
+        day_str = str(row.get("Day", "")).strip()
+        current_val = row.get(current_col, "")
+        last_val = row.get(last_col, "") if last_col else ""
+        
+        # Skip rows without current year data
+        if current_val == "" or current_val is None or current_val == 0:
+            continue
+        
+        try:
+            normalized = " ".join(day_str.split())
+            parsed = datetime.strptime(f"{normalized} {current_year}", "%b %d %Y")
+            
+            # Only include last N days up to today
+            days_ago = (today.date() - parsed.date()).days
+            if 0 <= days_ago <= days:
+                chart_data.append({
+                    "date": parsed,
+                    "day_str": day_str,
+                    str(current_year): int(current_val) if current_val else 0,
+                    str(last_year): int(last_val) if last_val else 0
+                })
+        except (ValueError, TypeError):
+            continue
+    
+    if not chart_data:
+        return None
+    
+    # Sort by date
+    chart_data.sort(key=lambda x: x["date"])
+    
+    # Create Plotly figure
+    fig = go.Figure()
+    
+    dates = [d["day_str"] for d in chart_data]
+    current_values = [d[str(current_year)] for d in chart_data]
+    last_values = [d[str(last_year)] for d in chart_data]
+    
+    # 2026 line (primary)
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=current_values,
+        mode='lines+markers',
+        name=str(current_year),
+        line=dict(color='#00D4AA', width=3),
+        marker=dict(size=6)
+    ))
+    
+    # 2025 line (comparison)
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=last_values,
+        mode='lines+markers',
+        name=str(last_year),
+        line=dict(color='#888888', width=2, dash='dot'),
+        marker=dict(size=4)
+    ))
+    
+    # Style the chart
+    fig.update_layout(
+        height=250,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#FFFFFF'),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        xaxis=dict(
+            showgrid=False,
+            tickangle=-45,
+            dtick=7  # Show every 7th label
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='rgba(255,255,255,0.1)'
+        ),
+        hovermode='x unified'
+    )
+    
+    return fig
+
+
 def calculate_lead_metrics(df):
     """Calculate lead time and conversion metrics for 2026 entries."""
     # Filter for 2026 entries with Inquiry Date populated
@@ -434,16 +543,22 @@ def main():
     except Exception as e:
         st.warning(f"Could not load inquiry data: {str(e)[:100]}")
     
+    # Load year comparison data for pace metrics and chart
+    yoy_df = None
+    try:
+        yoy_df = get_year_comparison_data()
+    except Exception as e:
+        pass  # Will show error in the booking pace section
+    
     col1, col2, col3 = st.columns([1, 1, 1])
     
     # Booking Pace
     with col1:
         st.subheader("📈 Booking Pace")
         try:
-            yoy_df = get_year_comparison_data()
-            
-            # Debug: check what columns we have
-            if yoy_df.empty:
+            if yoy_df is None:
+                st.error("Could not load booking data")
+            elif yoy_df.empty:
                 st.warning("Year comparison data is empty")
             else:
                 current, last_year, diff, error = calculate_booking_pace(yoy_df)
@@ -498,6 +613,15 @@ def main():
                     st.text(f"{source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
         else:
             st.info("No conversion data available")
+    
+    # Booking Pace Chart (full width)
+    try:
+        if yoy_df is not None and not yoy_df.empty:
+            chart = create_booking_pace_chart(yoy_df, days=30)
+            if chart:
+                st.plotly_chart(chart, use_container_width=True)
+    except Exception as e:
+        st.caption(f"Could not load pace chart: {str(e)[:50]}")
     
     st.divider()
     
