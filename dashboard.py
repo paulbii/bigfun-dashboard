@@ -73,8 +73,32 @@ def get_inquiry_tracker_data():
     client = get_google_client()
     sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
     worksheet = sheet.worksheet("Master View")
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
+    
+    # Use get_all_values() to handle duplicate/empty headers
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        return pd.DataFrame()
+    
+    # First row is headers
+    headers = all_values[0]
+    
+    # Make headers unique by appending index to duplicates/empties
+    seen = {}
+    unique_headers = []
+    for i, h in enumerate(headers):
+        if h == '' or h in seen:
+            # Create unique name for empty or duplicate
+            base = h if h else f'Column_{i}'
+            count = seen.get(base, 0)
+            unique_headers.append(f"{base}_{count}" if count > 0 else base)
+            seen[base] = count + 1
+        else:
+            unique_headers.append(h)
+            seen[h] = 1
+    
+    # Create DataFrame with remaining rows
+    df = pd.DataFrame(all_values[1:], columns=unique_headers)
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -131,30 +155,36 @@ def get_upcoming_events(days_ahead=14):
 def calculate_booking_pace(df):
     """Calculate current booking pace vs last year."""
     today = datetime.now()
-    current_day = today.strftime("%b %-d")  # e.g., "Feb 3"
-    
-    # Find the row for today (or closest)
-    # The Day column format is "Jan 1", "Jan 2", etc.
-    df_copy = df.copy()
     
     # Get current year and last year columns
     current_year = str(today.year)
     last_year = str(today.year - 1)
     
-    # Find today's row
+    # Check if columns exist
+    if current_year not in df.columns:
+        return None, None, None
+    
+    # Find today's row by matching the Day column
+    today_month_day = today.strftime("%b %-d")  # e.g., "Feb 3"
+    
     today_row = None
-    for idx, row in df_copy.iterrows():
-        day_str = str(row.get("Day", ""))
-        # Parse the day string
-        try:
-            parsed = datetime.strptime(f"{day_str} {today.year}", "%b %d %Y")
-            if parsed.date() == today.date():
-                today_row = row
-                break
-            elif parsed.date() < today.date():
-                today_row = row  # Keep last valid row before today
-        except ValueError:
-            continue
+    for idx, row in df.iterrows():
+        day_str = str(row.get("Day", "")).strip()
+        if day_str == today_month_day:
+            today_row = row
+            break
+    
+    # If exact match not found, find the most recent day before today
+    if today_row is None:
+        for idx, row in df.iterrows():
+            day_str = str(row.get("Day", "")).strip()
+            try:
+                # Parse the day string (e.g., "Feb 3")
+                parsed = datetime.strptime(f"{day_str} {today.year}", "%b %d %Y")
+                if parsed.date() <= today.date():
+                    today_row = row
+            except ValueError:
+                continue
     
     if today_row is None:
         return None, None, None
@@ -337,6 +367,15 @@ def main():
     # ROW 1: Booking Pace + Lead Metrics Summary
     # ==========================================================================
     
+    # Pre-calculate metrics for use across columns
+    inquiry_df = None
+    metrics = {}
+    try:
+        inquiry_df = get_inquiry_tracker_data()
+        metrics = calculate_lead_metrics(inquiry_df)
+    except Exception as e:
+        st.warning(f"Could not load inquiry data: {str(e)[:100]}")
+    
     col1, col2, col3 = st.columns([1, 1, 1])
     
     # Booking Pace
@@ -355,48 +394,41 @@ def main():
                 )
                 st.caption(f"Same time 2025: {last_year}")
             else:
-                st.info("No pace data available")
+                st.info("No pace data for today yet")
         except Exception as e:
-            st.error(f"Could not load booking pace: {e}")
+            st.error(f"Could not load booking pace: {str(e)[:100]}")
     
     # Lead Metrics Summary
     with col2:
         st.subheader("📊 2026 Inquiries")
-        try:
-            inquiry_df = get_inquiry_tracker_data()
-            metrics = calculate_lead_metrics(inquiry_df)
+        if metrics:
+            st.metric("Total Inquiries", metrics.get("total_inquiries", 0))
             
-            if metrics:
-                st.metric("Total Inquiries", metrics.get("total_inquiries", 0))
-                
-                sub_col1, sub_col2 = st.columns(2)
-                with sub_col1:
-                    st.metric("Booked", metrics.get("booked", 0))
-                    st.metric("Didn't Book", metrics.get("didnt_book", 0))
-                with sub_col2:
-                    st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
-                    st.metric("Cold/Ghosted", metrics.get("cold", 0))
-            else:
-                st.info("No inquiry data available")
-        except Exception as e:
-            st.error(f"Could not load inquiry metrics: {e}")
+            sub_col1, sub_col2 = st.columns(2)
+            with sub_col1:
+                st.metric("Booked", metrics.get("booked", 0))
+                st.metric("Didn't Book", metrics.get("didnt_book", 0))
+            with sub_col2:
+                st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
+                st.metric("Cold/Ghosted", metrics.get("cold", 0))
+        else:
+            st.info("No inquiry data available")
     
     # Conversion Rate
     with col3:
         st.subheader("🎯 Conversion")
-        try:
-            if metrics:
-                conversion = metrics.get("conversion_rate", 0)
-                st.metric("Conversion Rate", f"{conversion:.0f}%")
-                
-                # Show by source
-                st.caption("By Lead Source:")
-                by_source = metrics.get("by_source", {})
-                for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
-                    if data["total"] >= 3:  # Only show sources with meaningful volume
-                        st.text(f"  {source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
-        except Exception as e:
-            st.error(f"Could not load conversion data: {e}")
+        if metrics:
+            conversion = metrics.get("conversion_rate", 0)
+            st.metric("Conversion Rate", f"{conversion:.0f}%")
+            
+            # Show by source
+            st.caption("By Lead Source:")
+            by_source = metrics.get("by_source", {})
+            for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
+                if data["total"] >= 3:  # Only show sources with meaningful volume
+                    st.text(f"  {source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
+        else:
+            st.info("No conversion data available")
     
     st.divider()
     
@@ -456,49 +488,46 @@ def main():
     
     st.subheader("⏱️ Lead Time Analysis (2026)")
     
-    try:
-        if metrics and metrics.get("lead_times"):
-            col1, col2 = st.columns(2)
+    if metrics and metrics.get("lead_times"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Average Lead Time by Outcome**")
+            lead_times = metrics.get("lead_times", {})
             
-            with col1:
-                st.markdown("**Average Lead Time by Outcome**")
-                lead_times = metrics.get("lead_times", {})
-                
-                # Create a simple table
-                lt_data = []
-                for resolution, data in lead_times.items():
-                    lt_data.append({
-                        "Outcome": resolution,
-                        "Avg Lead Time": f"{data['avg_months']:.1f} months",
-                        "Count": data["count"]
-                    })
-                
-                if lt_data:
-                    lt_df = pd.DataFrame(lt_data)
-                    lt_df = lt_df.sort_values("Count", ascending=False)
-                    st.dataframe(lt_df, hide_index=True, use_container_width=True)
+            # Create a simple table
+            lt_data = []
+            for resolution, data in lead_times.items():
+                lt_data.append({
+                    "Outcome": resolution,
+                    "Avg Lead Time": f"{data['avg_months']:.1f} months",
+                    "Count": data["count"]
+                })
             
-            with col2:
-                st.markdown("**Days to Decision by Outcome**")
-                days_to_dec = metrics.get("days_to_decision", {})
-                
-                dtd_data = []
-                for resolution, data in days_to_dec.items():
-                    dtd_data.append({
-                        "Outcome": resolution,
-                        "Avg Days": f"{data['avg_days']:.0f}",
-                        "Median Days": f"{data['median_days']:.0f}",
-                        "Count": data["count"]
-                    })
-                
-                if dtd_data:
-                    dtd_df = pd.DataFrame(dtd_data)
-                    dtd_df = dtd_df.sort_values("Count", ascending=False)
-                    st.dataframe(dtd_df, hide_index=True, use_container_width=True)
-        else:
-            st.info("Lead time data requires Inquiry Date field (2026 entries)")
-    except Exception as e:
-        st.error(f"Could not calculate lead times: {e}")
+            if lt_data:
+                lt_df = pd.DataFrame(lt_data)
+                lt_df = lt_df.sort_values("Count", ascending=False)
+                st.dataframe(lt_df, hide_index=True, use_container_width=True)
+        
+        with col2:
+            st.markdown("**Days to Decision by Outcome**")
+            days_to_dec = metrics.get("days_to_decision", {})
+            
+            dtd_data = []
+            for resolution, data in days_to_dec.items():
+                dtd_data.append({
+                    "Outcome": resolution,
+                    "Avg Days": f"{data['avg_days']:.0f}",
+                    "Median Days": f"{data['median_days']:.0f}",
+                    "Count": data["count"]
+                })
+            
+            if dtd_data:
+                dtd_df = pd.DataFrame(dtd_data)
+                dtd_df = dtd_df.sort_values("Count", ascending=False)
+                st.dataframe(dtd_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("Lead time data requires Inquiry Date field (2026 entries)")
     
     st.divider()
     
@@ -508,33 +537,32 @@ def main():
     
     st.subheader("📞 Conversion by Interaction Level")
     
-    try:
-        if metrics and metrics.get("by_interaction"):
-            by_interaction = metrics.get("by_interaction", {})
-            
-            # Order by typical sales funnel
-            interaction_order = [
-                "Never acknowledged",
-                "Only acknowledged",
-                "Meaningful email interaction",
-                "Had phone call/video chat"
-            ]
-            
-            cols = st.columns(len(interaction_order))
-            
-            for idx, interaction in enumerate(interaction_order):
-                if interaction in by_interaction:
-                    data = by_interaction[interaction]
-                    with cols[idx]:
-                        # Shorten label for display
-                        short_label = interaction.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
-                        st.metric(
-                            label=short_label,
-                            value=f"{data['conversion_rate']:.0f}%",
-                            help=f"{data['booked']} booked / {data['total']} total"
-                        )
-    except Exception as e:
-        st.error(f"Could not load interaction data: {e}")
+    if metrics and metrics.get("by_interaction"):
+        by_interaction = metrics.get("by_interaction", {})
+        
+        # Order by typical sales funnel
+        interaction_order = [
+            "Never acknowledged",
+            "Only acknowledged",
+            "Meaningful email interaction",
+            "Had phone call/video chat"
+        ]
+        
+        cols = st.columns(len(interaction_order))
+        
+        for idx, interaction in enumerate(interaction_order):
+            if interaction in by_interaction:
+                data = by_interaction[interaction]
+                with cols[idx]:
+                    # Shorten label for display
+                    short_label = interaction.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
+                    st.metric(
+                        label=short_label,
+                        value=f"{data['conversion_rate']:.0f}%",
+                        help=f"{data['booked']} booked / {data['total']} total"
+                    )
+    else:
+        st.info("No interaction data available")
     
     # ==========================================================================
     # Footer
