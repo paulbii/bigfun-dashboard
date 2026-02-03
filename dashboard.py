@@ -113,6 +113,68 @@ def get_inquiry_tracker_data():
 
 
 @st.cache_data(ttl=300)
+def get_dj_booking_counts(year=2026):
+    """Count BOOKED events per DJ from the Availability Matrix."""
+    client = get_google_client()
+    sheet = client.open_by_key(AVAILABILITY_MATRIX_SHEET_ID)
+    
+    try:
+        worksheet = sheet.worksheet(str(year))
+    except Exception:
+        return {}
+    
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        return {}
+    
+    # Column mappings based on year (from SYSTEM_REFERENCE.md)
+    # 2026: A=Date, D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, I=TBA, K=Stephanie
+    # Columns are 0-indexed: D=3, E=4, F=5, G=6, H=7, K=10
+    if year == 2026:
+        dj_columns = {
+            "Henry": 3,
+            "Woody": 4,
+            "Paul": 5,
+            "Stefano": 6,
+            "Felipe": 7,
+            "Stephanie": 10
+        }
+    elif year == 2027:
+        # 2027: D=Henry, E=Woody, F=Paul, G=Stefano, H=Stephanie, L=Felipe
+        dj_columns = {
+            "Henry": 3,
+            "Woody": 4,
+            "Paul": 5,
+            "Stefano": 6,
+            "Stephanie": 7,
+            "Felipe": 11
+        }
+    else:
+        # 2025: D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, K=Stephanie
+        dj_columns = {
+            "Henry": 3,
+            "Woody": 4,
+            "Paul": 5,
+            "Stefano": 6,
+            "Felipe": 7,
+            "Stephanie": 10
+        }
+    
+    # Count BOOKED for each DJ
+    counts = {}
+    for dj, col_idx in dj_columns.items():
+        count = 0
+        for row in all_values[1:]:  # Skip header
+            if col_idx < len(row):
+                cell_value = str(row[col_idx]).strip().upper()
+                if cell_value == "BOOKED":
+                    count += 1
+        counts[dj] = count
+    
+    return counts
+
+
+@st.cache_data(ttl=300)
 def get_upcoming_events(days_ahead=14):
     """Fetch upcoming events from FileMaker gig database."""
     filemaker_url = get_filemaker_url()
@@ -927,6 +989,36 @@ def main():
             st.caption(f"Available: {list(by_interaction.keys())}")
     else:
         st.info("No interaction data available")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 5: DJ Bookings by Person
+    # ==========================================================================
+    
+    st.subheader("🎧 Events Booked by DJ (2026)")
+    
+    try:
+        dj_counts = get_dj_booking_counts(2026)
+        
+        if dj_counts:
+            # Sort by count descending
+            sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
+            
+            # Create columns for each DJ
+            cols = st.columns(len(sorted_djs))
+            
+            for idx, (dj_name, count) in enumerate(sorted_djs):
+                with cols[idx]:
+                    st.metric(label=dj_name, value=count)
+            
+            # Show total
+            total = sum(dj_counts.values())
+            st.caption(f"Total events assigned: {total}")
+        else:
+            st.info("No booking data available")
+    except Exception as e:
+        st.error(f"Could not load DJ bookings: {str(e)[:100]}")
     
     # ==========================================================================
     # Footer
