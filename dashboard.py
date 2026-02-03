@@ -63,8 +63,18 @@ def get_year_comparison_data():
     client = get_google_client()
     sheet = client.open_by_key(BOOKING_SNAPSHOTS_SHEET_ID)
     worksheet = sheet.worksheet("Year Comparison")
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
+    
+    # Use get_all_values() to handle any header weirdness
+    all_values = worksheet.get_all_values()
+    if not all_values:
+        return pd.DataFrame()
+    
+    # First row is headers
+    headers = all_values[0]
+    
+    # Create DataFrame with remaining rows
+    df = pd.DataFrame(all_values[1:], columns=headers)
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -114,7 +124,8 @@ def get_upcoming_events(days_ahead=14):
     # Query FileMaker for multiple days using the multi-day endpoint
     for offset in range(0, days_ahead, 7):  # Query in weekly chunks
         query_date = today + timedelta(days=offset)
-        date_str = query_date.strftime("%-m/%-d/%Y")
+        # Format date without leading zeros (works on all platforms)
+        date_str = f"{query_date.month}/{query_date.day}/{query_date.year}"
         
         try:
             url = f"{filemaker_url}/availabilityMDjson.php?date={date_str}"
@@ -156,16 +167,25 @@ def calculate_booking_pace(df):
     """Calculate current booking pace vs last year."""
     today = datetime.now()
     
-    # Get current year and last year columns
-    current_year = str(today.year)
-    last_year = str(today.year - 1)
+    # Get current year and last year - check both string and int column names
+    current_year = today.year
+    last_year = today.year - 1
     
-    # Check if columns exist
-    if current_year not in df.columns:
-        return None, None, None
+    # Find the actual column names (might be int or string)
+    current_col = None
+    last_col = None
+    for col in df.columns:
+        if str(col) == str(current_year):
+            current_col = col
+        if str(col) == str(last_year):
+            last_col = col
+    
+    if current_col is None:
+        return None, None, None, f"Column '{current_year}' not found. Available: {list(df.columns)[:10]}"
     
     # Find today's row by matching the Day column
-    today_month_day = today.strftime("%b %-d")  # e.g., "Feb 3"
+    # Format: "Feb 3" (no leading zero) - use lstrip to handle both
+    today_month_day = today.strftime("%b %d").replace(" 0", " ").strip()  # "Feb 3" not "Feb 03"
     
     today_row = None
     for idx, row in df.iterrows():
@@ -179,18 +199,21 @@ def calculate_booking_pace(df):
         for idx, row in df.iterrows():
             day_str = str(row.get("Day", "")).strip()
             try:
-                # Parse the day string (e.g., "Feb 3")
-                parsed = datetime.strptime(f"{day_str} {today.year}", "%b %d %Y")
+                # Parse the day string (e.g., "Feb 3" or "Feb  3")
+                # Normalize spaces
+                normalized = " ".join(day_str.split())
+                parsed = datetime.strptime(f"{normalized} {today.year}", "%b %d %Y")
                 if parsed.date() <= today.date():
                     today_row = row
             except ValueError:
                 continue
     
     if today_row is None:
-        return None, None, None
+        sample_days = df["Day"].head(5).tolist() if "Day" in df.columns else []
+        return None, None, None, f"No matching day found. Sample: {sample_days}"
     
-    current_count = today_row.get(current_year, 0)
-    last_year_count = today_row.get(last_year, 0)
+    current_count = today_row.get(current_col, 0)
+    last_year_count = today_row.get(last_col, 0) if last_col else 0
     
     # Handle empty or non-numeric values
     try:
@@ -202,7 +225,7 @@ def calculate_booking_pace(df):
     
     diff = current_count - last_year_count
     
-    return current_count, last_year_count, diff
+    return current_count, last_year_count, diff, None
 
 
 def calculate_lead_metrics(df):
@@ -228,9 +251,20 @@ def calculate_lead_metrics(df):
     metrics["we_turn_down"] = resolution_counts.get("We turn down", 0)
     metrics["canceled"] = resolution_counts.get("Canceled", 0)
     
-    # Conversion rate
+    # Conversion rate (simple)
     if metrics["total_inquiries"] > 0:
-        metrics["conversion_rate"] = metrics["booked"] / metrics["total_inquiries"] * 100
+        metrics["conversion_rate_simple"] = metrics["booked"] / metrics["total_inquiries"] * 100
+    else:
+        metrics["conversion_rate_simple"] = 0
+    
+    # Conversion rate (adjusted) - excludes capacity constraints and non-engagements
+    # Denominator = Total - Full - We turn down - Cold (capacity/non-engagement issues)
+    adjusted_denominator = (metrics["total_inquiries"] 
+                           - metrics["full"] 
+                           - metrics["we_turn_down"]
+                           - metrics["cold"])
+    if adjusted_denominator > 0:
+        metrics["conversion_rate"] = metrics["booked"] / adjusted_denominator * 100
     else:
         metrics["conversion_rate"] = 0
     
@@ -272,14 +306,18 @@ def calculate_lead_metrics(df):
         except Exception:
             pass
     
-    # Calculate averages
+    # Calculate averages and medians
     metrics["lead_times"] = {}
     for resolution, times in lead_times_by_resolution.items():
         if times:
             avg_days = sum(times) / len(times)
+            sorted_times = sorted(times)
+            median_days = sorted_times[len(sorted_times) // 2]
             metrics["lead_times"][resolution] = {
                 "avg_days": avg_days,
                 "avg_months": avg_days / 30.44,
+                "median_days": median_days,
+                "median_months": median_days / 30.44,
                 "count": len(times)
             }
     
@@ -383,20 +421,27 @@ def main():
         st.subheader("📈 Booking Pace")
         try:
             yoy_df = get_year_comparison_data()
-            current, last_year, diff = calculate_booking_pace(yoy_df)
             
-            if current is not None:
-                st.metric(
-                    label=f"2026 Booked (as of today)",
-                    value=current,
-                    delta=f"{diff:+d} vs 2025" if diff else None,
-                    delta_color="normal"
-                )
-                st.caption(f"Same time 2025: {last_year}")
+            # Debug: check what columns we have
+            if yoy_df.empty:
+                st.warning("Year comparison data is empty")
             else:
-                st.info("No pace data for today yet")
+                current, last_year, diff, error = calculate_booking_pace(yoy_df)
+                
+                if error:
+                    st.warning(error)
+                elif current is not None:
+                    st.metric(
+                        label=f"2026 Booked (as of today)",
+                        value=current,
+                        delta=f"{diff:+d} vs 2025" if diff else None,
+                        delta_color="normal"
+                    )
+                    st.caption(f"Same time 2025: {last_year}")
+                else:
+                    st.info("No pace data for today yet")
         except Exception as e:
-            st.error(f"Could not load booking pace: {str(e)[:100]}")
+            st.error(f"Could not load booking pace: {type(e).__name__}: {str(e)[:100]}")
     
     # Lead Metrics Summary
     with col2:
@@ -419,14 +464,18 @@ def main():
         st.subheader("🎯 Conversion")
         if metrics:
             conversion = metrics.get("conversion_rate", 0)
+            conversion_simple = metrics.get("conversion_rate_simple", 0)
+            
             st.metric("Conversion Rate", f"{conversion:.0f}%")
+            st.caption(f"Adjusted: excludes Full/Cold/Turn-away")
+            st.caption(f"Simple (all inquiries): {conversion_simple:.0f}%")
             
             # Show by source
-            st.caption("By Lead Source:")
+            st.markdown("**By Lead Source:**")
             by_source = metrics.get("by_source", {})
             for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
                 if data["total"] >= 3:  # Only show sources with meaningful volume
-                    st.text(f"  {source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
+                    st.text(f"{source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
         else:
             st.info("No conversion data available")
     
@@ -459,7 +508,7 @@ def main():
                     # Format date
                     try:
                         dt = datetime.strptime(date, "%Y-%m-%d")
-                        formatted_date = dt.strftime("%a %b %-d")
+                        formatted_date = f"{dt.strftime('%a %b')} {dt.day}"  # "Sat Feb 3"
                     except ValueError:
                         formatted_date = date
                     
@@ -492,7 +541,7 @@ def main():
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**Average Lead Time by Outcome**")
+            st.markdown("**Lead Time by Outcome**")
             lead_times = metrics.get("lead_times", {})
             
             # Create a simple table
@@ -500,7 +549,8 @@ def main():
             for resolution, data in lead_times.items():
                 lt_data.append({
                     "Outcome": resolution,
-                    "Avg Lead Time": f"{data['avg_months']:.1f} months",
+                    "Median": f"{data['median_months']:.1f} mo",
+                    "Avg": f"{data['avg_months']:.1f} mo",
                     "Count": data["count"]
                 })
             
@@ -548,19 +598,29 @@ def main():
             "Had phone call/video chat"
         ]
         
-        cols = st.columns(len(interaction_order))
+        # Find matching keys (case-insensitive partial match)
+        matched_interactions = []
+        for target in interaction_order:
+            for actual_key in by_interaction.keys():
+                if target.lower() in actual_key.lower() or actual_key.lower() in target.lower():
+                    matched_interactions.append((target, actual_key))
+                    break
         
-        for idx, interaction in enumerate(interaction_order):
-            if interaction in by_interaction:
-                data = by_interaction[interaction]
+        if matched_interactions:
+            cols = st.columns(len(matched_interactions))
+            
+            for idx, (label, actual_key) in enumerate(matched_interactions):
+                data = by_interaction[actual_key]
                 with cols[idx]:
-                    # Shorten label for display
-                    short_label = interaction.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
+                    short_label = label.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
                     st.metric(
                         label=short_label,
                         value=f"{data['conversion_rate']:.0f}%",
                         help=f"{data['booked']} booked / {data['total']} total"
                     )
+        else:
+            # Show what we actually have
+            st.caption(f"Available: {list(by_interaction.keys())}")
     else:
         st.info("No interaction data available")
     
