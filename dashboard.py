@@ -58,7 +58,7 @@ def get_google_client():
 # DATA FETCHING
 # =============================================================================
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def get_year_comparison_data():
     """Fetch YoY booking comparison from Booking Snapshots sheet."""
     client = get_google_client()
@@ -78,7 +78,7 @@ def get_year_comparison_data():
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def get_inquiry_tracker_data():
     """Fetch all inquiry data from the Inquiry Tracker sheet."""
     client = get_google_client()
@@ -112,7 +112,7 @@ def get_inquiry_tracker_data():
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def get_dj_booking_counts(year=2026):
     """Count BOOKED events per DJ from the Availability Matrix."""
     client = get_google_client()
@@ -177,32 +177,43 @@ def get_dj_booking_counts(year=2026):
     # Count TBA (unassigned) bookings
     # TBA can be: "BOOKED", "BOOKED x 2", "AAG", "BOOKED, AAG", etc.
     tba_count = 0
+    tba_debug = []  # Track what we're counting for debug
     for row in all_values[1:]:
         if tba_col < len(row):
             cell_value = str(row[tba_col]).strip().upper()
             if not cell_value:
                 continue
+            
+            added = 0
             # Count each BOOKED mention
             if "BOOKED X " in cell_value:
                 # "BOOKED x 2" -> 2
                 try:
-                    num = int(cell_value.split("X")[1].strip())
-                    tba_count += num
+                    num = int(cell_value.split("X")[1].strip().split()[0])
+                    added = num
                 except (IndexError, ValueError):
-                    tba_count += 1
+                    added = 1
             elif "BOOKED" in cell_value:
-                # Count comma-separated items (e.g., "BOOKED, AAG" = 2)
-                tba_count += cell_value.count("BOOKED")
-            if "AAG" in cell_value and "BOOKED" not in cell_value:
-                # Just "AAG" without BOOKED
-                tba_count += 1
+                added = 1
+            
+            # Add AAG if present (separate from BOOKED)
+            if "AAG" in cell_value:
+                if "BOOKED" not in cell_value:
+                    added = 1  # Just AAG alone
+                else:
+                    added += 1  # AAG in addition to BOOKED
+            
+            if added > 0:
+                tba_count += added
+                tba_debug.append(f"{cell_value} -> {added}")
     
     counts["TBA"] = tba_count
+    counts["_tba_debug"] = tba_debug  # Hidden debug info
     
     return counts
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def get_upcoming_events(days_ahead=14):
     """Fetch upcoming events from FileMaker gig database."""
     filemaker_url = get_filemaker_url()
@@ -762,10 +773,10 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 1: Booking Pace + Lead Metrics Summary
+    # ROW 1: Booking Pace + Inquiries Summary
     # ==========================================================================
     
-    # Pre-calculate metrics for use across columns
+    # Pre-calculate metrics for use across sections
     inquiry_df = None
     metrics = {}
     try:
@@ -781,7 +792,7 @@ def main():
     except Exception as e:
         pass  # Will show error in the booking pace section
     
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2 = st.columns(2)
     
     # Booking Pace
     with col1:
@@ -809,7 +820,7 @@ def main():
         except Exception as e:
             st.error(f"Could not load booking pace: {type(e).__name__}: {str(e)[:100]}")
     
-    # Lead Metrics Summary
+    # Inquiries Summary
     with col2:
         st.subheader("📊 2026 Inquiries")
         if metrics:
@@ -825,25 +836,84 @@ def main():
         else:
             st.info("No inquiry data available")
     
-    # Conversion Rate
-    with col3:
-        st.subheader("🎯 Conversion")
-        if metrics:
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 2: Conversion (all metrics)
+    # ==========================================================================
+    
+    st.subheader("🎯 Conversion")
+    
+    if metrics:
+        # Top row: Overall rate + by source
+        conv_col1, conv_col2 = st.columns(2)
+        
+        with conv_col1:
             conversion = metrics.get("conversion_rate", 0)
             conversion_simple = metrics.get("conversion_rate_simple", 0)
             
-            st.metric("Conversion Rate", f"{conversion:.0f}%")
+            st.metric("Overall Conversion Rate", f"{conversion:.0f}%")
             st.caption(f"Excludes: Full, Turn-away, Cold (no response)")
             st.caption(f"Simple (all inquiries): {conversion_simple:.0f}%")
-            
-            # Show by source
+        
+        with conv_col2:
             st.markdown("**By Lead Source:**")
             by_source = metrics.get("by_source", {})
             for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
                 if data["total"] >= 3:  # Only show sources with meaningful volume
                     st.text(f"{source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
-        else:
-            st.info("No conversion data available")
+        
+        # Bottom row: By interaction level
+        st.markdown("**By Interaction Level:**")
+        
+        if metrics.get("by_interaction"):
+            by_interaction = metrics.get("by_interaction", {})
+            
+            # Order by typical sales funnel (excluding "Never acknowledged" - those are AAG handoffs)
+            interaction_order = [
+                "Only acknowledged",
+                "Meaningful email interaction",
+                "Had phone call/video chat"
+            ]
+            
+            # Find matching keys (case-insensitive partial match)
+            matched_interactions = []
+            for target in interaction_order:
+                for actual_key in by_interaction.keys():
+                    if target.lower() in actual_key.lower() or actual_key.lower() in target.lower():
+                        matched_interactions.append((target, actual_key))
+                        break
+            
+            if matched_interactions:
+                # Add AAG column at the end
+                cols = st.columns(len(matched_interactions) + 1)
+                
+                for idx, (label, actual_key) in enumerate(matched_interactions):
+                    data = by_interaction[actual_key]
+                    with cols[idx]:
+                        short_label = label.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
+                        st.metric(
+                            label=short_label,
+                            value=f"{data['conversion_rate']:.0f}%",
+                            help=f"{data['booked']} booked / {data['total']} total"
+                        )
+                
+                # AAG house DJ bookings (separate from sales funnel)
+                with cols[-1]:
+                    aag_count = metrics.get("aag_house_bookings", 0)
+                    st.metric(
+                        label="AAG (house DJ)",
+                        value=aag_count,
+                        help="Allied Arts Guild bookings via venue handoff"
+                    )
+    else:
+        st.info("No conversion data available")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # ROW 3: Booking Pace Charts
+    # ==========================================================================
     
     # Booking Pace Charts
     try:
@@ -867,7 +937,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 2: Upcoming Events
+    # ROW 4: Upcoming Events
     # ==========================================================================
     
     st.subheader("📅 Upcoming Events (Next 14 Days)")
@@ -917,7 +987,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 3: DJ Bookings by Person
+    # ROW 5: DJ Bookings by Person
     # ==========================================================================
     
     st.subheader("🎧 Events Booked by DJ (2026)")
@@ -926,6 +996,9 @@ def main():
         dj_counts = get_dj_booking_counts(2026)
         
         if dj_counts:
+            # Remove internal debug info
+            dj_counts.pop("_tba_debug", None)
+            
             # Separate TBA from assigned DJs
             tba_count = dj_counts.pop("TBA", 0)
             
@@ -950,61 +1023,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 4: Conversion by Interaction Level
-    # ==========================================================================
-    
-    st.subheader("📞 Conversion by Interaction Level")
-    
-    if metrics and metrics.get("by_interaction"):
-        by_interaction = metrics.get("by_interaction", {})
-        
-        # Order by typical sales funnel (excluding "Never acknowledged" - those are AAG handoffs)
-        interaction_order = [
-            "Only acknowledged",
-            "Meaningful email interaction",
-            "Had phone call/video chat"
-        ]
-        
-        # Find matching keys (case-insensitive partial match)
-        matched_interactions = []
-        for target in interaction_order:
-            for actual_key in by_interaction.keys():
-                if target.lower() in actual_key.lower() or actual_key.lower() in target.lower():
-                    matched_interactions.append((target, actual_key))
-                    break
-        
-        if matched_interactions:
-            # Add AAG column at the end
-            cols = st.columns(len(matched_interactions) + 1)
-            
-            for idx, (label, actual_key) in enumerate(matched_interactions):
-                data = by_interaction[actual_key]
-                with cols[idx]:
-                    short_label = label.replace("Meaningful email interaction", "Email exchange").replace("Had phone call/video chat", "Phone/video call")
-                    st.metric(
-                        label=short_label,
-                        value=f"{data['conversion_rate']:.0f}%",
-                        help=f"{data['booked']} booked / {data['total']} total"
-                    )
-            
-            # AAG house DJ bookings (separate from sales funnel)
-            with cols[-1]:
-                aag_count = metrics.get("aag_house_bookings", 0)
-                st.metric(
-                    label="AAG (house DJ)",
-                    value=aag_count,
-                    help="Allied Arts Guild bookings via venue handoff"
-                )
-        else:
-            # Show what we actually have
-            st.caption(f"Available: {list(by_interaction.keys())}")
-    else:
-        st.info("No interaction data available")
-    
-    st.divider()
-    
-    # ==========================================================================
-    # ROW 5: Lead Time Analysis
+    # ROW 6: Lead Time Analysis
     # ==========================================================================
     
     st.subheader("⏱️ Lead Time Analysis (2026)")
@@ -1056,7 +1075,7 @@ def main():
     # ==========================================================================
     
     st.divider()
-    st.caption("Big Fun DJ Operations Dashboard • Data refreshes every 5 minutes • Click 🔄 to force refresh")
+    st.caption("Big Fun DJ Operations Dashboard • Data refreshes hourly • Click 🔄 to force refresh")
 
 
 if __name__ == "__main__":
