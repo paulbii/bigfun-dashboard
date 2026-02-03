@@ -129,7 +129,7 @@ def get_dj_booking_counts(year=2026):
     
     # Column mappings based on year (from SYSTEM_REFERENCE.md)
     # 2026: A=Date, D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, I=TBA, K=Stephanie
-    # Columns are 0-indexed: D=3, E=4, F=5, G=6, H=7, K=10
+    # Columns are 0-indexed: D=3, E=4, F=5, G=6, H=7, I=8, K=10
     if year == 2026:
         dj_columns = {
             "Henry": 3,
@@ -139,8 +139,9 @@ def get_dj_booking_counts(year=2026):
             "Felipe": 7,
             "Stephanie": 10
         }
+        tba_col = 8
     elif year == 2027:
-        # 2027: D=Henry, E=Woody, F=Paul, G=Stefano, H=Stephanie, L=Felipe
+        # 2027: D=Henry, E=Woody, F=Paul, G=Stefano, H=Stephanie, I=TBA, L=Felipe
         dj_columns = {
             "Henry": 3,
             "Woody": 4,
@@ -149,8 +150,9 @@ def get_dj_booking_counts(year=2026):
             "Stephanie": 7,
             "Felipe": 11
         }
+        tba_col = 8
     else:
-        # 2025: D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, K=Stephanie
+        # 2025: D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, I=TBA, K=Stephanie
         dj_columns = {
             "Henry": 3,
             "Woody": 4,
@@ -159,6 +161,7 @@ def get_dj_booking_counts(year=2026):
             "Felipe": 7,
             "Stephanie": 10
         }
+        tba_col = 8
     
     # Count BOOKED for each DJ
     counts = {}
@@ -170,6 +173,31 @@ def get_dj_booking_counts(year=2026):
                 if cell_value == "BOOKED":
                     count += 1
         counts[dj] = count
+    
+    # Count TBA (unassigned) bookings
+    # TBA can be: "BOOKED", "BOOKED x 2", "AAG", "BOOKED, AAG", etc.
+    tba_count = 0
+    for row in all_values[1:]:
+        if tba_col < len(row):
+            cell_value = str(row[tba_col]).strip().upper()
+            if not cell_value:
+                continue
+            # Count each BOOKED mention
+            if "BOOKED X " in cell_value:
+                # "BOOKED x 2" -> 2
+                try:
+                    num = int(cell_value.split("X")[1].strip())
+                    tba_count += num
+                except (IndexError, ValueError):
+                    tba_count += 1
+            elif "BOOKED" in cell_value:
+                # Count comma-separated items (e.g., "BOOKED, AAG" = 2)
+                tba_count += cell_value.count("BOOKED")
+            if "AAG" in cell_value and "BOOKED" not in cell_value:
+                # Just "AAG" without BOOKED
+                tba_count += 1
+    
+    counts["TBA"] = tba_count
     
     return counts
 
@@ -889,52 +917,35 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 3: Lead Time Analysis
+    # ROW 3: DJ Bookings by Person
     # ==========================================================================
     
-    st.subheader("⏱️ Lead Time Analysis (2026)")
+    st.subheader("🎧 Events Booked by DJ (2026)")
     
-    if metrics and metrics.get("lead_times"):
-        col1, col2 = st.columns(2)
+    try:
+        dj_counts = get_dj_booking_counts(2026)
         
-        with col1:
-            st.markdown("**Lead Time by Outcome**")
-            lead_times = metrics.get("lead_times", {})
+        if dj_counts:
+            # Separate TBA from assigned DJs
+            tba_count = dj_counts.pop("TBA", 0)
             
-            # Create a simple table
-            lt_data = []
-            for resolution, data in lead_times.items():
-                lt_data.append({
-                    "Outcome": resolution,
-                    "Median": f"{data['median_months']:.1f} mo",
-                    "Avg": f"{data['avg_months']:.1f} mo",
-                    "Count": data["count"]
-                })
+            # Sort assigned DJs by count descending
+            sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
             
-            if lt_data:
-                lt_df = pd.DataFrame(lt_data)
-                lt_df = lt_df.sort_values("Count", ascending=False)
-                st.dataframe(lt_df, hide_index=True, use_container_width=True)
-        
-        with col2:
-            st.markdown("**Days to Decision by Outcome**")
-            days_to_dec = metrics.get("days_to_decision", {})
+            # Create columns for each DJ
+            cols = st.columns(len(sorted_djs))
             
-            dtd_data = []
-            for resolution, data in days_to_dec.items():
-                dtd_data.append({
-                    "Outcome": resolution,
-                    "Avg Days": f"{data['avg_days']:.0f}",
-                    "Median Days": f"{data['median_days']:.0f}",
-                    "Count": data["count"]
-                })
+            for idx, (dj_name, count) in enumerate(sorted_djs):
+                with cols[idx]:
+                    st.metric(label=dj_name, value=count)
             
-            if dtd_data:
-                dtd_df = pd.DataFrame(dtd_data)
-                dtd_df = dtd_df.sort_values("Count", ascending=False)
-                st.dataframe(dtd_df, hide_index=True, use_container_width=True)
-    else:
-        st.info("Lead time data requires Inquiry Date field (2026 entries)")
+            # Show totals
+            assigned_total = sum(dj_counts.values())
+            st.caption(f"Assigned: {assigned_total} • Unassigned (TBA): {tba_count} • Total: {assigned_total + tba_count}")
+        else:
+            st.info("No booking data available")
+    except Exception as e:
+        st.error(f"Could not load DJ bookings: {str(e)[:100]}")
     
     st.divider()
     
@@ -993,32 +1004,52 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 5: DJ Bookings by Person
+    # ROW 5: Lead Time Analysis
     # ==========================================================================
     
-    st.subheader("🎧 Events Booked by DJ (2026)")
+    st.subheader("⏱️ Lead Time Analysis (2026)")
     
-    try:
-        dj_counts = get_dj_booking_counts(2026)
+    if metrics and metrics.get("lead_times"):
+        col1, col2 = st.columns(2)
         
-        if dj_counts:
-            # Sort by count descending
-            sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
+        with col1:
+            st.markdown("**Lead Time by Outcome**")
+            lead_times = metrics.get("lead_times", {})
             
-            # Create columns for each DJ
-            cols = st.columns(len(sorted_djs))
+            # Create a simple table
+            lt_data = []
+            for resolution, data in lead_times.items():
+                lt_data.append({
+                    "Outcome": resolution,
+                    "Median": f"{data['median_months']:.1f} mo",
+                    "Avg": f"{data['avg_months']:.1f} mo",
+                    "Count": data["count"]
+                })
             
-            for idx, (dj_name, count) in enumerate(sorted_djs):
-                with cols[idx]:
-                    st.metric(label=dj_name, value=count)
+            if lt_data:
+                lt_df = pd.DataFrame(lt_data)
+                lt_df = lt_df.sort_values("Count", ascending=False)
+                st.dataframe(lt_df, hide_index=True, use_container_width=True)
+        
+        with col2:
+            st.markdown("**Days to Decision by Outcome**")
+            days_to_dec = metrics.get("days_to_decision", {})
             
-            # Show total
-            total = sum(dj_counts.values())
-            st.caption(f"Total events assigned: {total}")
-        else:
-            st.info("No booking data available")
-    except Exception as e:
-        st.error(f"Could not load DJ bookings: {str(e)[:100]}")
+            dtd_data = []
+            for resolution, data in days_to_dec.items():
+                dtd_data.append({
+                    "Outcome": resolution,
+                    "Avg Days": f"{data['avg_days']:.0f}",
+                    "Median Days": f"{data['median_days']:.0f}",
+                    "Count": data["count"]
+                })
+            
+            if dtd_data:
+                dtd_df = pd.DataFrame(dtd_data)
+                dtd_df = dtd_df.sort_values("Count", ascending=False)
+                st.dataframe(dtd_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("Lead time data requires Inquiry Date field (2026 entries)")
     
     # ==========================================================================
     # Footer
