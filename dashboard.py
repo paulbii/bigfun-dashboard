@@ -192,26 +192,33 @@ def calculate_booking_pace(df):
         # Windows doesn't support %-d, fall back to manual
         today_month_day = today.strftime("%b %d").lstrip("0").replace(" 0", " ")
     
-    today_row = None
+    # Find the most recent row that has data for the current year
+    # (today's row might not be populated yet)
+    best_row = None
+    best_day = None
+    
     for idx, row in df.iterrows():
         day_str = str(row.get("Day", "")).strip()
-        if day_str == today_month_day:
-            today_row = row
-            break
+        current_val = row.get(current_col, "")
+        
+        # Skip rows without current year data
+        # Empty cells may come back as "", None, or 0
+        if current_val == "" or current_val is None or current_val == 0:
+            continue
+            
+        try:
+            # Parse the day string
+            normalized = " ".join(day_str.split())
+            parsed = datetime.strptime(f"{normalized} {today.year}", "%b %d %Y")
+            
+            # Only consider days up to today
+            if parsed.date() <= today.date():
+                best_row = row
+                best_day = day_str
+        except ValueError:
+            continue
     
-    # If exact match not found, find the most recent day before today
-    if today_row is None:
-        for idx, row in df.iterrows():
-            day_str = str(row.get("Day", "")).strip()
-            try:
-                # Parse the day string (e.g., "Feb 3" or "Feb  3")
-                # Normalize spaces
-                normalized = " ".join(day_str.split())
-                parsed = datetime.strptime(f"{normalized} {today.year}", "%b %d %Y")
-                if parsed.date() <= today.date():
-                    today_row = row
-            except ValueError:
-                continue
+    today_row = best_row
     
     if today_row is None:
         sample_days = df["Day"].head(5).tolist() if "Day" in df.columns else []
