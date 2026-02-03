@@ -598,6 +598,20 @@ def calculate_lead_metrics(df):
                 "conversion_rate": booked / total * 100
             }
     
+    # AAG house DJ bookings (venue handoffs, not sales conversions)
+    # These are: Allied Arts Guild venue, Booked, Never acknowledged
+    venue_col = "Venue (if known)"
+    if venue_col in df_2026.columns:
+        # Match variations: "Allied Arts Guild", "AAG", etc.
+        aag_bookings = df_2026[
+            (df_2026[venue_col].astype(str).str.contains("Allied Arts|AAG", case=False, na=False, regex=True)) &
+            (df_2026["Resolution"] == "Booked") &
+            (df_2026["Level of interaction"].astype(str).str.lower().str.contains("never", na=False))
+        ]
+        metrics["aag_house_bookings"] = len(aag_bookings)
+    else:
+        metrics["aag_house_bookings"] = 0
+    
     return metrics
 
 
@@ -857,9 +871,8 @@ def main():
     if metrics and metrics.get("by_interaction"):
         by_interaction = metrics.get("by_interaction", {})
         
-        # Order by typical sales funnel
+        # Order by typical sales funnel (excluding "Never acknowledged" - those are AAG handoffs)
         interaction_order = [
-            "Never acknowledged",
             "Only acknowledged",
             "Meaningful email interaction",
             "Had phone call/video chat"
@@ -874,7 +887,8 @@ def main():
                     break
         
         if matched_interactions:
-            cols = st.columns(len(matched_interactions))
+            # Add AAG column at the end
+            cols = st.columns(len(matched_interactions) + 1)
             
             for idx, (label, actual_key) in enumerate(matched_interactions):
                 data = by_interaction[actual_key]
@@ -885,6 +899,15 @@ def main():
                         value=f"{data['conversion_rate']:.0f}%",
                         help=f"{data['booked']} booked / {data['total']} total"
                     )
+            
+            # AAG house DJ bookings (separate from sales funnel)
+            with cols[-1]:
+                aag_count = metrics.get("aag_house_bookings", 0)
+                st.metric(
+                    label="AAG (house DJ)",
+                    value=aag_count,
+                    help="Allied Arts Guild bookings via venue handoff"
+                )
         else:
             # Show what we actually have
             st.caption(f"Available: {list(by_interaction.keys())}")
