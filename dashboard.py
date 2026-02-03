@@ -573,29 +573,43 @@ def calculate_lead_metrics(df):
             }
     
     # Conversion by source
+    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
     source_counts = df_2026.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_source"] = {}
     for source in source_counts.index:
-        total = source_counts.loc[source].sum()
-        booked = source_counts.loc[source].get("Booked", 0)
-        if total > 0:
+        row = source_counts.loc[source]
+        booked = row.get("Booked", 0)
+        full = row.get("Full", 0)
+        turn_down = row.get("We turn down", 0)
+        
+        # Adjusted total excludes capacity constraints
+        adjusted_total = row.sum() - full - turn_down
+        
+        if adjusted_total > 0:
             metrics["by_source"][source] = {
-                "total": total,
-                "booked": booked,
-                "conversion_rate": booked / total * 100
+                "total": int(adjusted_total),
+                "booked": int(booked),
+                "conversion_rate": booked / adjusted_total * 100
             }
     
     # Level of interaction analysis
+    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
     interaction_counts = df_2026.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_interaction"] = {}
     for interaction in interaction_counts.index:
-        total = interaction_counts.loc[interaction].sum()
-        booked = interaction_counts.loc[interaction].get("Booked", 0)
-        if total > 0:
+        row = interaction_counts.loc[interaction]
+        booked = row.get("Booked", 0)
+        full = row.get("Full", 0)
+        turn_down = row.get("We turn down", 0)
+        
+        # Adjusted total excludes capacity constraints
+        adjusted_total = row.sum() - full - turn_down
+        
+        if adjusted_total > 0:
             metrics["by_interaction"][interaction] = {
-                "total": total,
-                "booked": booked,
-                "conversion_rate": booked / total * 100
+                "total": int(adjusted_total),
+                "booked": int(booked),
+                "conversion_rate": booked / adjusted_total * 100
             }
     
     # AAG house DJ bookings (venue handoffs, not sales conversions)
