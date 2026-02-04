@@ -113,8 +113,10 @@ def get_inquiry_tracker_data():
     # Track pre-dedup count
     pre_dedup_count = len(df)
     
-    # Deduplicate by (Event Date, Venue), keeping newest Timestamp
-    # This handles cases where an inquiry was closed (e.g., Cold) then reopened and booked
+    # Deduplicate by (Event Date, Venue), with special handling for multiple bookings
+    # - Multiple Booked entries = separate clients, keep all
+    # - Canceled after any Booked = one cancellation, reduce count by 1
+    # - Non-Booked only = keep newest
     if "Timestamp" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
         # Parse timestamp for sorting
         df["_parsed_timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
@@ -122,8 +124,45 @@ def get_inquiry_tracker_data():
         # Sort by timestamp descending (newest first)
         df = df.sort_values("_parsed_timestamp", ascending=False)
         
-        # Keep first (newest) entry for each Event Date + Venue combination
-        df = df.drop_duplicates(subset=["Event Date", "Venue (if known)"], keep="first")
+        # Smart deduplication
+        def smart_dedup(group):
+            if len(group) == 1:
+                return group
+            
+            resolution_col = "Resolution" if "Resolution" in group.columns else None
+            if not resolution_col:
+                return group.head(1)
+            
+            # Find Booked and Canceled rows
+            booked_mask = group[resolution_col].str.lower().str.strip() == "booked"
+            canceled_mask = group[resolution_col].str.lower().str.strip() == "canceled"
+            
+            booked_rows = group[booked_mask].sort_values("_parsed_timestamp", ascending=False)
+            canceled_rows = group[canceled_mask]
+            
+            if len(booked_rows) == 0:
+                # No bookings - keep newest row only
+                return group.head(1)
+            
+            # Count valid cancellations (timestamp after ANY booking)
+            earliest_booking_ts = booked_rows["_parsed_timestamp"].min()
+            valid_cancellations = 0
+            for _, cancel_row in canceled_rows.iterrows():
+                cancel_ts = cancel_row["_parsed_timestamp"]
+                if pd.notna(cancel_ts) and pd.notna(earliest_booking_ts) and cancel_ts > earliest_booking_ts:
+                    valid_cancellations += 1
+            
+            # Net bookings = booked - cancellations (minimum 0)
+            net_bookings = max(0, len(booked_rows) - valid_cancellations)
+            
+            if net_bookings == 0:
+                # All bookings canceled - return newest canceled row
+                return canceled_rows.head(1) if len(canceled_rows) > 0 else group.head(1)
+            
+            # Return the newest N booked rows
+            return booked_rows.head(net_bookings)
+        
+        df = df.groupby(["Event Date", "Venue (if known)"], group_keys=False).apply(smart_dedup)
         
         # Clean up temp column
         df = df.drop(columns=["_parsed_timestamp"])
