@@ -755,12 +755,12 @@ def calculate_lead_metrics(df):
     # AAG house DJ bookings (venue handoffs, not sales conversions)
     # These are: Allied Arts Guild venue, Booked, Never acknowledged
     venue_col = "Venue (if known)"
-    if venue_col in df_2026.columns:
+    if venue_col in df_2026_events.columns:
         # Match variations: "Allied Arts Guild", "AAG", etc.
-        aag_bookings = df_2026[
-            (df_2026[venue_col].astype(str).str.contains("Allied Arts|AAG", case=False, na=False, regex=True)) &
-            (df_2026["Resolution"] == "Booked") &
-            (df_2026["Level of interaction"].astype(str).str.lower().str.contains("never", na=False))
+        aag_bookings = df_2026_events[
+            (df_2026_events[venue_col].astype(str).str.contains("Allied Arts|AAG", case=False, na=False, regex=True)) &
+            (df_2026_events["Resolution"] == "Booked") &
+            (df_2026_events["Level of interaction"].astype(str).str.lower().str.contains("never", na=False))
         ]
         metrics["aag_house_bookings"] = len(aag_bookings)
     else:
