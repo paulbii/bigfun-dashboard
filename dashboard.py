@@ -110,6 +110,9 @@ def get_inquiry_tracker_data():
     # Create DataFrame with remaining rows
     df = pd.DataFrame(all_values[1:], columns=unique_headers)
     
+    # Track pre-dedup count
+    pre_dedup_count = len(df)
+    
     # Deduplicate by (Event Date, Venue), keeping newest Timestamp
     # This handles cases where an inquiry was closed (e.g., Cold) then reopened and booked
     if "Timestamp" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
@@ -124,6 +127,11 @@ def get_inquiry_tracker_data():
         
         # Clean up temp column
         df = df.drop(columns=["_parsed_timestamp"])
+    
+    # Store dedup stats in a special row (will be filtered out later)
+    # Actually, let's add columns instead
+    df["_dedup_pre"] = pre_dedup_count
+    df["_dedup_post"] = len(df)
     
     return df
 
@@ -193,7 +201,6 @@ def get_dj_booking_counts(year=2026):
     # Count TBA (unassigned) bookings
     # TBA can be: "BOOKED", "BOOKED x 2", "AAG", "BOOKED, AAG", etc.
     tba_count = 0
-    tba_debug = []  # Track what we're counting for debug
     for row in all_values[1:]:
         if tba_col < len(row):
             cell_value = str(row[tba_col]).strip().upper()
@@ -221,10 +228,8 @@ def get_dj_booking_counts(year=2026):
             
             if added > 0:
                 tba_count += added
-                tba_debug.append(f"{cell_value} -> {added}")
     
     counts["TBA"] = tba_count
-    counts["_tba_debug"] = tba_debug  # Hidden debug info
     
     return counts
 
@@ -615,6 +620,35 @@ def calculate_lead_metrics(df):
     
     metrics = {}
     
+    # DEBUG: Track filtering steps
+    metrics["_debug"] = {
+        "total_2026_events": len(df_2026_events),
+        "with_both_dates": len(df_with_dates),
+        "booked_before_filter": len(df_2026_events[df_2026_events["Resolution"] == "Booked"]),
+        "booked_with_dates": len(df_with_dates[df_with_dates["Resolution"] == "Booked"]),
+    }
+    
+    # Find booked events missing dates
+    booked_2026 = df_2026_events[df_2026_events["Resolution"] == "Booked"]
+    booked_missing_inquiry = booked_2026[booked_2026["Inquiry Date"].astype(str).str.strip() == ""]
+    booked_missing_decision = booked_2026[booked_2026["Decision Date"].astype(str).str.strip() == ""]
+    
+    metrics["_debug"]["booked_missing_inquiry_date"] = len(booked_missing_inquiry)
+    metrics["_debug"]["booked_missing_decision_date"] = len(booked_missing_decision)
+    
+    if len(booked_missing_inquiry) > 0:
+        # Get event dates and venues of missing
+        missing_info = []
+        for _, row in booked_missing_inquiry.iterrows():
+            missing_info.append(f"{row.get('Event Date', '?')} - {row.get('Venue (if known)', '?')[:30]}")
+        metrics["_debug"]["missing_inquiry_details"] = missing_info[:10]  # Limit to 10
+    
+    if len(booked_missing_decision) > 0:
+        missing_info = []
+        for _, row in booked_missing_decision.iterrows():
+            missing_info.append(f"{row.get('Event Date', '?')} - {row.get('Venue (if known)', '?')[:30]}")
+        metrics["_debug"]["missing_decision_details"] = missing_info[:10]
+    
     # Total counts by resolution (only rows with both dates)
     resolution_counts = df_with_dates["Resolution"].value_counts().to_dict()
     metrics["total_inquiries"] = len(df_with_dates)
@@ -872,6 +906,33 @@ def main():
             with sub_col2:
                 st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
                 st.metric("Cold/Ghosted", metrics.get("cold", 0))
+            
+            # Debug section
+            if metrics.get("_debug"):
+                with st.expander("🔍 Debug: Filtering details"):
+                    debug = metrics["_debug"]
+                    
+                    # Show dedup stats if available
+                    if inquiry_df is not None and "_dedup_pre" in inquiry_df.columns:
+                        pre = inquiry_df["_dedup_pre"].iloc[0] if len(inquiry_df) > 0 else "?"
+                        post = inquiry_df["_dedup_post"].iloc[0] if len(inquiry_df) > 0 else "?"
+                        removed = pre - post if isinstance(pre, int) and isinstance(post, int) else "?"
+                        st.write(f"**Deduplication:** {pre} rows → {post} rows ({removed} duplicates removed)")
+                        st.write("---")
+                    
+                    st.write(f"Total 2026 events in tracker: {debug.get('total_2026_events', '?')}")
+                    st.write(f"Booked (before date filter): {debug.get('booked_before_filter', '?')}")
+                    st.write(f"With both Inquiry+Decision dates: {debug.get('with_both_dates', '?')}")
+                    st.write(f"Booked (after date filter): {debug.get('booked_with_dates', '?')}")
+                    st.write("---")
+                    st.write(f"Booked missing Inquiry Date: {debug.get('booked_missing_inquiry_date', 0)}")
+                    if debug.get('missing_inquiry_details'):
+                        for item in debug['missing_inquiry_details']:
+                            st.text(f"  • {item}")
+                    st.write(f"Booked missing Decision Date: {debug.get('booked_missing_decision_date', 0)}")
+                    if debug.get('missing_decision_details'):
+                        for item in debug['missing_decision_details']:
+                            st.text(f"  • {item}")
         else:
             st.info("No inquiry data available")
     
@@ -1035,9 +1096,6 @@ def main():
         dj_counts = get_dj_booking_counts(2026)
         
         if dj_counts:
-            # Remove internal debug info
-            dj_counts.pop("_tba_debug", None)
-            
             # Separate TBA from assigned DJs
             tba_count = dj_counts.pop("TBA", 0)
             
@@ -1107,7 +1165,7 @@ def main():
                 dtd_df = dtd_df.sort_values("Count", ascending=False)
                 st.dataframe(dtd_df, hide_index=True, use_container_width=True)
     else:
-        st.info("Lead time data requires Inquiry Date field (2026 entries)")
+        st.info("Lead time data requires both Inquiry Date and Decision Date fields")
     
     # ==========================================================================
     # Footer
