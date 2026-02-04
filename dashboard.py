@@ -580,21 +580,44 @@ def create_booking_pace_chart_ytd(df):
 
 
 def calculate_lead_metrics(df):
-    """Calculate lead time and conversion metrics for 2026 entries."""
-    # Filter for 2026 entries with Inquiry Date populated
-    df_2026 = df[df["Timestamp"].astype(str).str.contains("2026", na=False)].copy()
+    """Calculate lead time and conversion metrics for 2026 events."""
+    # Filter for 2026 events (by Event Date, not Timestamp)
+    def is_2026_event(event_date_str):
+        if not event_date_str or str(event_date_str).strip() == "":
+            return False
+        try:
+            # Try various date formats
+            for fmt in ["%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"]:
+                try:
+                    dt = pd.to_datetime(event_date_str, format=fmt)
+                    return dt.year == 2026
+                except:
+                    continue
+            # Fallback to pandas auto-parse
+            dt = pd.to_datetime(event_date_str, errors="coerce")
+            return pd.notna(dt) and dt.year == 2026
+        except:
+            return False
     
-    # Filter for rows with Inquiry Date
-    df_with_dates = df_2026[df_2026["Inquiry Date"].astype(str).str.strip() != ""].copy()
+    df_2026_events = df[df["Event Date"].apply(is_2026_event)].copy()
+    
+    if df_2026_events.empty:
+        return {}
+    
+    # For conversion calculations, only use rows with BOTH Inquiry Date AND Decision Date
+    df_with_dates = df_2026_events[
+        (df_2026_events["Inquiry Date"].astype(str).str.strip() != "") &
+        (df_2026_events["Decision Date"].astype(str).str.strip() != "")
+    ].copy()
     
     if df_with_dates.empty:
         return {}
     
     metrics = {}
     
-    # Total counts by resolution
-    resolution_counts = df_2026["Resolution"].value_counts().to_dict()
-    metrics["total_inquiries"] = len(df_2026)
+    # Total counts by resolution (only rows with both dates)
+    resolution_counts = df_with_dates["Resolution"].value_counts().to_dict()
+    metrics["total_inquiries"] = len(df_with_dates)
     metrics["booked"] = resolution_counts.get("Booked", 0)
     metrics["didnt_book"] = resolution_counts.get("Didn't Book", 0)
     metrics["full"] = resolution_counts.get("Full", 0)
@@ -610,9 +633,9 @@ def calculate_lead_metrics(df):
     
     # Conversion rate (adjusted) - excludes capacity constraints and non-engagements
     # Exclude: Full, We turn down, Cold ONLY when "Never acknowledged"
-    cold_never_acknowledged = len(df_2026[
-        (df_2026["Resolution"] == "Cold") & 
-        (df_2026["Level of interaction"] == "Never acknowledged")
+    cold_never_acknowledged = len(df_with_dates[
+        (df_with_dates["Resolution"] == "Cold") & 
+        (df_with_dates["Level of interaction"] == "Never acknowledged")
     ])
     
     adjusted_denominator = (metrics["total_inquiries"] 
@@ -691,7 +714,7 @@ def calculate_lead_metrics(df):
     
     # Conversion by source
     # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
-    source_counts = df_2026.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
+    source_counts = df_with_dates.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_source"] = {}
     for source in source_counts.index:
         row = source_counts.loc[source]
@@ -711,7 +734,7 @@ def calculate_lead_metrics(df):
     
     # Level of interaction analysis
     # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
-    interaction_counts = df_2026.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
+    interaction_counts = df_with_dates.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_interaction"] = {}
     for interaction in interaction_counts.index:
         row = interaction_counts.loc[interaction]
