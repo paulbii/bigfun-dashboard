@@ -881,7 +881,32 @@ def main():
     if st.button("🔄 Refresh Data"):
         st.cache_data.clear()
         st.rerun()
-    
+
+    with st.expander("⬇️ Export Data"):
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            try:
+                export_df = get_inquiry_tracker_data()
+                st.download_button(
+                    label="Inquiry Tracker (CSV)",
+                    data=export_df.to_csv(index=False),
+                    file_name=f"inquiry-tracker-{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                )
+            except Exception as e:
+                st.error(f"Could not load inquiry data: {str(e)[:80]}")
+        with export_col2:
+            try:
+                export_yoy = get_year_comparison_data()
+                st.download_button(
+                    label="Booking Pace YoY (CSV)",
+                    data=export_yoy.to_csv(index=False),
+                    file_name=f"booking-pace-{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                )
+            except Exception as e:
+                st.error(f"Could not load booking data: {str(e)[:80]}")
+
     st.divider()
     
     # ==========================================================================
