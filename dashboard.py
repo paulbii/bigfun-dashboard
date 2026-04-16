@@ -328,12 +328,16 @@ def get_upcoming_events(days_ahead=14):
 
 def calculate_booking_pace(df):
     """Calculate current booking pace vs last year."""
+    if "Day" not in df.columns:
+        found = ", ".join(df.columns[:10])
+        return None, None, None, f"Year Comparison missing 'Day' column. Found: {found}"
+
     today = datetime.now()
-    
+
     # Get current year and last year - check both string and int column names
     current_year = today.year
     last_year = today.year - 1
-    
+
     # Find the actual column names (might be int or string)
     current_col = None
     last_col = None
@@ -623,8 +627,29 @@ def create_booking_pace_chart_ytd(df):
     return fig
 
 
+REQUIRED_INQUIRY_COLUMNS = [
+    "Event Date",
+    "Inquiry Date",
+    "Decision Date",
+    "Resolution",
+    "Venue (if known)",
+    "Level of interaction",
+    "Initial Contact",
+]
+
+
+def _check_required_columns(df, required, source):
+    """Raise a clear error listing ALL missing columns, not just the first one hit."""
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"{source} missing columns: {', '.join(missing)}")
+
+
 def calculate_lead_metrics(df):
     """Calculate lead time and conversion metrics for 2026 events."""
+    if df is None or df.empty:
+        return {}
+    _check_required_columns(df, REQUIRED_INQUIRY_COLUMNS, "Inquiry Tracker")
     # Filter for 2026 events (by Event Date, not Timestamp)
     def is_2026_event(event_date_str):
         if not event_date_str or str(event_date_str).strip() == "":
@@ -707,8 +732,8 @@ def calculate_lead_metrics(df):
     # Conversion rate (adjusted) - excludes capacity constraints and non-engagements
     # Exclude: Full, We turn down, Cold ONLY when "Never acknowledged"
     cold_never_acknowledged = len(df_with_dates[
-        (df_with_dates["Resolution"] == "Cold") & 
-        (df_with_dates["Level of interaction"] == "Never acknowledged")
+        (df_with_dates["Resolution"] == "Cold") &
+        (df_with_dates["Level of interaction"].str.strip().str.lower() == "never acknowledged")
     ])
     
     adjusted_denominator = (metrics["total_inquiries"] 
@@ -919,6 +944,10 @@ def main():
     try:
         inquiry_df = get_inquiry_tracker_data()
         metrics = calculate_lead_metrics(inquiry_df)
+    except KeyError as e:
+        st.warning(f"⚠️ {e}")
+        if inquiry_df is not None:
+            st.caption(f"Columns found: {', '.join(inquiry_df.columns[:15])}")
     except Exception as e:
         st.warning(f"Could not load inquiry data: {str(e)[:100]}")
     
