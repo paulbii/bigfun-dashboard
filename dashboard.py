@@ -83,7 +83,9 @@ def get_inquiry_tracker_data():
     """Fetch all inquiry data from the Inquiry Tracker sheet."""
     client = get_google_client()
     sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
-    worksheet = sheet.worksheet("Master View")
+    # Read the raw form source, not the derived "Master View" tab.
+    # Master View is an array formula; gspread returns empty for some spilled cells.
+    worksheet = sheet.worksheet("Form Responses 1")
     
     # Use get_all_values() to handle duplicate/empty headers
     all_values = worksheet.get_all_values()
