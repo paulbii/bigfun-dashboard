@@ -168,8 +168,13 @@ def get_inquiry_tracker_data():
         # Group on a derived key so Event Date / Venue stay as real columns.
         # pandas 2.3+ drops grouping columns from apply() results by default,
         # which was silently removing these columns from the DataFrame.
+        # Case-normalize the venue so "el Prado" and "el PRADO" group together
+        # (so a Canceled row cancels its Booked counterpart even if the venue
+        # casing differs between submissions).
         df["_dedup_key"] = (
-            df["Event Date"].astype(str) + "|" + df["Venue (if known)"].astype(str)
+            df["Event Date"].astype(str).str.strip()
+            + "|"
+            + df["Venue (if known)"].astype(str).str.strip().str.lower()
         )
         df = df.groupby("_dedup_key", group_keys=False).apply(smart_dedup)
 
@@ -236,14 +241,21 @@ def get_dj_booking_counts(year=2026):
         }
         tba_col = 8
     
-    # Count BOOKED for each DJ
+    # Count BOOKED for each DJ.
+    # "BOOKED, BACKUP" (e.g., Woody at Nestldown for a morning gig + evening backup)
+    # and "WEDFAIRE" (wedding fair) both count as a booked event.
     counts = {}
     for dj, col_idx in dj_columns.items():
         count = 0
         for row in all_values[1:]:  # Skip header
             if col_idx < len(row):
                 cell_value = str(row[col_idx]).strip().upper()
-                if cell_value == "BOOKED":
+                if (
+                    cell_value == "BOOKED"
+                    or cell_value == "WEDFAIRE"
+                    or cell_value.startswith("BOOKED,")
+                    or cell_value.startswith("BOOKED ")
+                ):
                     count += 1
         counts[dj] = count
     
