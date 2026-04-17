@@ -165,10 +165,16 @@ def get_inquiry_tracker_data():
             # Return the newest N booked rows
             return booked_rows.head(net_bookings)
         
-        df = df.groupby(["Event Date", "Venue (if known)"], group_keys=False).apply(smart_dedup)
-        
-        # Clean up temp column
-        df = df.drop(columns=["_parsed_timestamp"])
+        # Group on a derived key so Event Date / Venue stay as real columns.
+        # pandas 2.3+ drops grouping columns from apply() results by default,
+        # which was silently removing these columns from the DataFrame.
+        df["_dedup_key"] = (
+            df["Event Date"].astype(str) + "|" + df["Venue (if known)"].astype(str)
+        )
+        df = df.groupby("_dedup_key", group_keys=False).apply(smart_dedup)
+
+        # Clean up temp columns
+        df = df.drop(columns=["_parsed_timestamp", "_dedup_key"])
     
     # Store dedup stats in a special row (will be filtered out later)
     # Actually, let's add columns instead
@@ -951,20 +957,6 @@ def main():
         st.warning(f"⚠️ {e}")
         if inquiry_df is not None:
             st.caption(f"Columns found: {', '.join(inquiry_df.columns[:15])}")
-        with st.expander("🔍 Debug: raw gspread response"):
-            try:
-                client = get_google_client()
-                sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
-                ws = sheet.worksheet("Form Responses 1")
-                raw_header = ws.row_values(1)
-                raw_all = ws.get_values("A1:P1")
-                st.write("**row_values(1):**", raw_header)
-                st.write(f"**len:** {len(raw_header)}")
-                st.write("**get_values('A1:P1'):**", raw_all)
-                st.write("**Sheet title:**", sheet.title)
-                st.write("**All tab names:**", [w.title for w in sheet.worksheets()])
-            except Exception as ex:
-                st.write(f"Debug fetch failed: {ex}")
     except Exception as e:
         st.warning(f"Could not load inquiry data: {str(e)[:100]}")
     
