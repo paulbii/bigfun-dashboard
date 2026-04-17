@@ -86,9 +86,10 @@ def get_inquiry_tracker_data():
     # Read the raw form source, not the derived "Master View" tab.
     # Master View is an array formula; gspread returns empty for some spilled cells.
     worksheet = sheet.worksheet("Form Responses 1")
-    
-    # Use get_all_values() to handle duplicate/empty headers
-    all_values = worksheet.get_all_values()
+
+    # Explicit range beats get_all_values() here — get_all_values has been
+    # dropping columns B and C for reasons we haven't pinned down.
+    all_values = worksheet.get_values("A1:P")
     if not all_values:
         return pd.DataFrame()
     
