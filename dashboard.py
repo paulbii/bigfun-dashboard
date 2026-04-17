@@ -173,8 +173,9 @@ def get_inquiry_tracker_data():
         )
         df = df.groupby("_dedup_key", group_keys=False).apply(smart_dedup)
 
-        # Clean up temp columns
-        df = df.drop(columns=["_parsed_timestamp", "_dedup_key"])
+        # Clean up temp columns (pandas 2.3+ may have already dropped _dedup_key
+        # as the grouping column, so ignore missing).
+        df = df.drop(columns=["_parsed_timestamp", "_dedup_key"], errors="ignore")
     
     # Store dedup stats in a special row (will be filtered out later)
     # Actually, let's add columns instead
