@@ -951,6 +951,20 @@ def main():
         st.warning(f"⚠️ {e}")
         if inquiry_df is not None:
             st.caption(f"Columns found: {', '.join(inquiry_df.columns[:15])}")
+        with st.expander("🔍 Debug: raw gspread response"):
+            try:
+                client = get_google_client()
+                sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
+                ws = sheet.worksheet("Form Responses 1")
+                raw_header = ws.row_values(1)
+                raw_all = ws.get_values("A1:P1")
+                st.write("**row_values(1):**", raw_header)
+                st.write(f"**len:** {len(raw_header)}")
+                st.write("**get_values('A1:P1'):**", raw_all)
+                st.write("**Sheet title:**", sheet.title)
+                st.write("**All tab names:**", [w.title for w in sheet.worksheets()])
+            except Exception as ex:
+                st.write(f"Debug fetch failed: {ex}")
     except Exception as e:
         st.warning(f"Could not load inquiry data: {str(e)[:100]}")
     
