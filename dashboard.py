@@ -982,29 +982,30 @@ def main():
     
     col1, col2 = st.columns(2)
     
-    # Booking Pace
+    # Booking Pace — live 2026 event count from Inquiry Tracker (event-based).
+    # Booking Snapshots is kept only for the historical 2025 comparison, since
+    # 2025 events were not tracked in the inquiry form. Starting with the
+    # 2027 vs 2026 comparison, this can switch entirely to Inquiry Tracker.
     with col1:
         st.subheader("📈 Booking Pace")
         try:
-            if yoy_df is None:
-                st.error("Could not load booking data")
-            elif yoy_df.empty:
-                st.warning("Year comparison data is empty")
+            current = metrics.get("booked") if metrics else None
+            last_year = None
+            if yoy_df is not None and not yoy_df.empty:
+                _, last_year, _, _ = calculate_booking_pace(yoy_df)
+
+            if current is None:
+                st.info("No pace data available yet")
             else:
-                current, last_year, diff, error = calculate_booking_pace(yoy_df)
-                
-                if error:
-                    st.warning(error)
-                elif current is not None:
-                    st.metric(
-                        label=f"2026 Booked (as of today)",
-                        value=current,
-                        delta=f"{diff:+d} vs 2025" if diff else None,
-                        delta_color="normal"
-                    )
+                diff = (current - last_year) if last_year is not None else None
+                st.metric(
+                    label=f"2026 Booked (as of today)",
+                    value=current,
+                    delta=f"{diff:+d} vs 2025" if diff else None,
+                    delta_color="normal"
+                )
+                if last_year is not None:
                     st.caption(f"Same time 2025: {last_year}")
-                else:
-                    st.info("No pace data for today yet")
         except Exception as e:
             st.error(f"Could not load booking pace: {type(e).__name__}: {str(e)[:100]}")
     
