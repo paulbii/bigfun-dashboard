@@ -112,9 +112,30 @@ def get_inquiry_tracker_data():
     
     # Create DataFrame with remaining rows
     df = pd.DataFrame(all_values[1:], columns=unique_headers)
-    
+
     # Track pre-dedup count
     pre_dedup_count = len(df)
+
+    # Count pre-dedup 2026 cancellations so the UI can show
+    # "peak bookings" (current Booked + cancelled after booking).
+    # Done before smart_dedup strips cancellations that paired with Bookeds.
+    canceled_2026 = 0
+    if "Resolution" in df.columns and "Event Date" in df.columns:
+        def _is_2026(ed):
+            s = str(ed).strip()
+            if not s:
+                return False
+            for fmt in ["%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"]:
+                try:
+                    return pd.to_datetime(s, format=fmt).year == 2026
+                except Exception:
+                    continue
+            dt = pd.to_datetime(s, errors="coerce")
+            return pd.notna(dt) and dt.year == 2026
+
+        canceled_2026 = int(
+            ((df["Resolution"] == "Canceled") & df["Event Date"].apply(_is_2026)).sum()
+        )
     
     # Deduplicate by (Event Date, Venue), with special handling for multiple bookings
     # - Multiple Booked entries = separate clients, keep all
@@ -186,6 +207,7 @@ def get_inquiry_tracker_data():
     # Actually, let's add columns instead
     df["_dedup_pre"] = pre_dedup_count
     df["_dedup_post"] = len(df)
+    df["_canceled_2026_predup"] = canceled_2026
     
     return df
 
@@ -743,6 +765,13 @@ def calculate_lead_metrics(df):
     metrics["full"] = resolution_counts.get("Full", 0)
     metrics["cold"] = resolution_counts.get("Cold", 0)
     metrics["we_turn_down"] = resolution_counts.get("We turn down", 0)
+
+    # Pre-dedup count of 2026 cancellations (see get_inquiry_tracker_data).
+    # Lets the UI show that total Booked passed through a higher peak.
+    if "_canceled_2026_predup" in df.columns and len(df) > 0:
+        metrics["canceled_pre_dedup_2026"] = int(df["_canceled_2026_predup"].iloc[0])
+    else:
+        metrics["canceled_pre_dedup_2026"] = 0
     metrics["canceled"] = resolution_counts.get("Canceled", 0)
     
     # Conversion rate (simple)
@@ -1017,7 +1046,11 @@ def main():
             
             sub_col1, sub_col2 = st.columns(2)
             with sub_col1:
-                st.metric("Booked", metrics.get("booked", 0))
+                booked = metrics.get("booked", 0)
+                canceled = metrics.get("canceled_pre_dedup_2026", 0)
+                st.metric("Booked", booked)
+                if canceled > 0:
+                    st.caption(f"{canceled} canceled after booking (peak: {booked + canceled})")
                 st.metric("Didn't Book", metrics.get("didnt_book", 0))
             with sub_col2:
                 st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
