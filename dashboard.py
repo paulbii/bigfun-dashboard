@@ -35,6 +35,17 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# BIG FUN's average event revenue (context/work.md). Used as the deal-size
+# constant in the pipeline-velocity formula.
+AVG_DEAL_SIZE = 2100
+
+LEAD_TIME_BUCKETS = ["<3 mo", "3-6 mo", "6-12 mo", "12+ mo"]
+
+# Resolutions that aren't sales failures (capacity/policy outcomes). Excluded
+# from conversion-rate denominators and pipeline-velocity calculations so the
+# numbers reflect actual sales performance, not how full the calendar is.
+CAPACITY_RESOLUTIONS = {"Full", "We turn down"}
+
 # =============================================================================
 # AUTHENTICATION
 # =============================================================================
@@ -119,8 +130,12 @@ def get_inquiry_tracker_data():
     # Count pre-dedup 2026 cancellations so the UI can show
     # "peak bookings" (current Booked + cancelled after booking).
     # Done before smart_dedup strips cancellations that paired with Bookeds.
+    # Also split into pre-booking vs post-booking based on whether any Booked
+    # row exists for the same (event date, venue) key.
     canceled_2026 = 0
-    if "Resolution" in df.columns and "Event Date" in df.columns:
+    canceled_post_booking_2026 = 0
+    canceled_pre_booking_2026 = 0
+    if "Resolution" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
         def _is_2026(ed):
             s = str(ed).strip()
             if not s:
@@ -133,9 +148,25 @@ def get_inquiry_tracker_data():
             dt = pd.to_datetime(s, errors="coerce")
             return pd.notna(dt) and dt.year == 2026
 
-        canceled_2026 = int(
-            ((df["Resolution"] == "Canceled") & df["Event Date"].apply(_is_2026)).sum()
+        is_2026_event = df["Event Date"].apply(_is_2026)
+        canceled_2026 = int(((df["Resolution"] == "Canceled") & is_2026_event).sum())
+
+        # Match the same key shape as smart_dedup so post-booking detection
+        # agrees with how the deduplicator pairs cancellations with bookings.
+        cancel_key = (
+            df["Event Date"].astype(str).str.strip()
+            + "|"
+            + df["Venue (if known)"].astype(str).str.strip().str.lower()
         )
+        booked_keys_2026 = set(cancel_key[(df["Resolution"] == "Booked") & is_2026_event])
+        canceled_post_booking_2026 = int(
+            (
+                (df["Resolution"] == "Canceled")
+                & is_2026_event
+                & cancel_key.isin(booked_keys_2026)
+            ).sum()
+        )
+        canceled_pre_booking_2026 = canceled_2026 - canceled_post_booking_2026
     
     # Deduplicate by (Event Date, Venue), with special handling for multiple bookings
     # - Multiple Booked entries = separate clients, keep all
@@ -208,7 +239,9 @@ def get_inquiry_tracker_data():
     df["_dedup_pre"] = pre_dedup_count
     df["_dedup_post"] = len(df)
     df["_canceled_2026_predup"] = canceled_2026
-    
+    df["_canceled_post_booking_2026"] = canceled_post_booking_2026
+    df["_canceled_pre_booking_2026"] = canceled_pre_booking_2026
+
     return df
 
 
@@ -770,8 +803,12 @@ def calculate_lead_metrics(df):
     # Lets the UI show that total Booked passed through a higher peak.
     if "_canceled_2026_predup" in df.columns and len(df) > 0:
         metrics["canceled_pre_dedup_2026"] = int(df["_canceled_2026_predup"].iloc[0])
+        metrics["canceled_post_booking_2026"] = int(df["_canceled_post_booking_2026"].iloc[0])
+        metrics["canceled_pre_booking_2026"] = int(df["_canceled_pre_booking_2026"].iloc[0])
     else:
         metrics["canceled_pre_dedup_2026"] = 0
+        metrics["canceled_post_booking_2026"] = 0
+        metrics["canceled_pre_booking_2026"] = 0
     metrics["canceled"] = resolution_counts.get("Canceled", 0)
     
     # Conversion rate (simple)
@@ -918,6 +955,356 @@ def calculate_lead_metrics(df):
     return metrics
 
 
+# =============================================================================
+# LEAD-TIME / VELOCITY / SURVIVAL METRICS
+# =============================================================================
+
+def _bucket_lead_time(days):
+    """Map a lead-time-at-inquiry value (days) to a bucket label."""
+    if days is None or pd.isna(days) or days < 0:
+        return None
+    if days < 90:
+        return "<3 mo"
+    if days < 180:
+        return "3-6 mo"
+    if days < 365:
+        return "6-12 mo"
+    return "12+ mo"
+
+
+def _parse_event_date(value):
+    """Inquiry Tracker's Event Date field uses several formats; try them in order."""
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+    for fmt in ["%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"]:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except Exception:
+            continue
+    return pd.to_datetime(s, errors="coerce")
+
+
+def _is_year(value, year):
+    dt = _parse_event_date(value)
+    return pd.notna(dt) and dt.year == year
+
+
+def _iter_dated_rows(df, event_year=None):
+    """Yield dicts for rows that have both Inquiry Date and Decision Date parsed."""
+    for _, row in df.iterrows():
+        if event_year is not None and not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        inquiry_dt = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
+        decision_dt = pd.to_datetime(row.get("Decision Date"), errors="coerce")
+        if pd.isna(inquiry_dt) or pd.isna(decision_dt):
+            continue
+        event_dt = _parse_event_date(row.get("Event Date", ""))
+        yield {
+            "event_dt": event_dt,
+            "inquiry_dt": inquiry_dt,
+            "decision_dt": decision_dt,
+            "resolution": str(row.get("Resolution", "")).strip(),
+            "source": str(row.get("Initial Contact", "")).strip(),
+        }
+
+
+def calculate_lead_time_buckets(df, event_year=2026):
+    """Conversion rate and decision velocity per lead-time-at-inquiry bucket."""
+    rows = []
+    for r in _iter_dated_rows(df, event_year):
+        if pd.isna(r["event_dt"]):
+            continue
+        lead_days = (r["event_dt"] - r["inquiry_dt"]).days
+        if lead_days < 0:
+            continue
+        rows.append({
+            "bucket": _bucket_lead_time(lead_days),
+            "resolution": r["resolution"],
+            "lead_days": lead_days,
+            "decision_days": (r["decision_dt"] - r["inquiry_dt"]).days,
+        })
+
+    if not rows:
+        return {}
+
+    bdf = pd.DataFrame(rows)
+    out = {}
+    for bucket in LEAD_TIME_BUCKETS:
+        sub = bdf[bdf["bucket"] == bucket]
+        if sub.empty:
+            continue
+        eligible = sub[~sub["resolution"].isin(CAPACITY_RESOLUTIONS)]
+        booked = int((sub["resolution"] == "Booked").sum())
+        denom = len(eligible)
+        decisions = sub["decision_days"].dropna()
+        out[bucket] = {
+            "count": len(sub),
+            "booked": booked,
+            "eligible": denom,
+            "conversion_rate": (booked / denom * 100) if denom > 0 else 0.0,
+            "median_days_to_decision": float(decisions.median()) if len(decisions) > 0 else 0.0,
+            "avg_days_to_decision": float(decisions.mean()) if len(decisions) > 0 else 0.0,
+            "by_resolution": sub["resolution"].value_counts().to_dict(),
+        }
+    return out
+
+
+def calculate_days_to_decision_by_source(df, event_year=2026, min_count=3):
+    """Days-to-decision per Initial Contact source. Filters out sources with < min_count rows."""
+    rows = []
+    for r in _iter_dated_rows(df, event_year):
+        days = (r["decision_dt"] - r["inquiry_dt"]).days
+        if days < 0:
+            continue
+        rows.append({
+            "source": r["source"] or "(blank)",
+            "days": days,
+            "resolution": r["resolution"],
+        })
+
+    if not rows:
+        return {}
+
+    sdf = pd.DataFrame(rows)
+    out = {}
+    for source, group in sdf.groupby("source"):
+        if len(group) < min_count:
+            continue
+        booked = group[group["resolution"] == "Booked"]
+        out[source] = {
+            "count": int(len(group)),
+            "booked_count": int(len(booked)),
+            "median_days_all": float(group["days"].median()),
+            "median_days_booked": float(booked["days"].median()) if len(booked) > 0 else None,
+            "avg_days_booked": float(booked["days"].mean()) if len(booked) > 0 else None,
+        }
+    return out
+
+
+def calculate_velocity_weekly(df, weeks=26, window_weeks=8, avg_deal_size=AVG_DEAL_SIZE):
+    """
+    Trailing-window pipeline velocity, computed weekly.
+
+    Pipeline velocity = (qualified opps × avg deal size × win rate) / avg cycle days.
+    For each of the last `weeks` weeks, look back `window_weeks` weeks of decisions
+    and compute the formula. Uses all rows with both dates regardless of event year,
+    so the metric reflects sales-process performance across the calendar.
+    """
+    rows = []
+    for _, row in df.iterrows():
+        inq = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
+        dec = pd.to_datetime(row.get("Decision Date"), errors="coerce")
+        if pd.isna(inq) or pd.isna(dec):
+            continue
+        cycle = (dec - inq).days
+        if cycle < 0:
+            continue
+        rows.append({
+            "decision_date": dec,
+            "resolution": str(row.get("Resolution", "")).strip(),
+            "cycle": cycle,
+        })
+
+    if not rows:
+        return []
+
+    vdf = pd.DataFrame(rows)
+    today = datetime.now().date()
+
+    weekly = []
+    for w in range(weeks - 1, -1, -1):
+        end = today - timedelta(days=7 * w)
+        start = end - timedelta(days=7 * window_weeks)
+        window = vdf[
+            (vdf["decision_date"].dt.date > start)
+            & (vdf["decision_date"].dt.date <= end)
+        ]
+        eligible = window[~window["resolution"].isin(CAPACITY_RESOLUTIONS)]
+        opps = len(eligible)
+        booked_count = int((eligible["resolution"] == "Booked").sum())
+        win_rate = (booked_count / opps) if opps > 0 else 0.0
+        avg_cycle = float(eligible["cycle"].mean()) if opps > 0 else 0.0
+        velocity = ((opps * avg_deal_size * win_rate) / avg_cycle) if avg_cycle > 0 else 0.0
+        weekly.append({
+            "week_ending": end,
+            "opps": opps,
+            "booked": booked_count,
+            "win_rate_pct": float(win_rate * 100),
+            "avg_cycle_days": avg_cycle,
+            "velocity_dollars_per_day": float(velocity),
+        })
+    return weekly
+
+
+def calculate_survival_curve(df, event_year=2026, max_days=120):
+    """
+    For each eventual outcome (Booked, Lost), the cumulative % of that cohort
+    that has decided by day N after inquiry. Plotted as 100% - this gives a
+    "% still open" survival curve.
+    """
+    bookers = []
+    losers = []
+    for r in _iter_dated_rows(df, event_year):
+        days = (r["decision_dt"] - r["inquiry_dt"]).days
+        if days < 0:
+            continue
+        if r["resolution"] == "Booked":
+            bookers.append(days)
+        elif r["resolution"] in ("Didn't Book", "Cold"):
+            losers.append(days)
+
+    def cdf(days_list):
+        if not days_list:
+            return []
+        sorted_days = sorted(days_list)
+        n = len(sorted_days)
+        out = []
+        idx = 0
+        for d in range(0, max_days + 1):
+            while idx < n and sorted_days[idx] <= d:
+                idx += 1
+            out.append({
+                "day": d,
+                "pct_decided": idx / n * 100,
+                "n_decided": idx,
+                "n_total": n,
+            })
+        return out
+
+    return {
+        "Booked": cdf(bookers),
+        "Lost": cdf(losers),
+    }
+
+
+# =============================================================================
+# CHARTS FOR NEW METRICS
+# =============================================================================
+
+def create_velocity_chart(weekly_data):
+    """Line chart of pipeline velocity ($/day) over time."""
+    if not weekly_data:
+        return None
+
+    fig = go.Figure()
+    dates = [d["week_ending"].strftime("%b %d") for d in weekly_data]
+    velocities = [d["velocity_dollars_per_day"] for d in weekly_data]
+
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=velocities,
+        mode="lines+markers",
+        name="Velocity",
+        line=dict(color="#00D4AA", width=3),
+        marker=dict(size=6),
+        hovertemplate="<b>Week ending %{x}</b><br>$%{y:,.0f}/day<extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=240,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF"),
+        xaxis=dict(showgrid=False, tickangle=-45, dtick=4),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+            tickprefix="$",
+            tickformat=",",
+        ),
+        hovermode="x unified",
+        showlegend=False,
+    )
+    return fig
+
+
+def create_lead_time_bucket_chart(buckets):
+    """Bar chart of conversion rate by lead-time-at-inquiry bucket."""
+    if not buckets:
+        return None
+
+    labels = [b for b in LEAD_TIME_BUCKETS if b in buckets]
+    rates = [buckets[b]["conversion_rate"] for b in labels]
+    counts = [buckets[b]["count"] for b in labels]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels,
+        y=rates,
+        marker_color="#00D4AA",
+        text=[f"{r:.0f}% (n={c})" for r, c in zip(rates, counts)],
+        textposition="auto",
+        hovertemplate="<b>%{x}</b><br>Conversion: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        height=260,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF"),
+        xaxis=dict(title="Lead time at inquiry"),
+        yaxis=dict(
+            title="Conversion rate",
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+        ),
+        showlegend=False,
+    )
+    return fig
+
+
+def create_survival_curve_chart(curves):
+    """Line chart of % still undecided vs days since inquiry, split by eventual outcome."""
+    if not curves:
+        return None
+
+    fig = go.Figure()
+    color_map = {"Booked": "#00D4AA", "Lost": "#FF6B6B"}
+
+    for category, points in curves.items():
+        if not points:
+            continue
+        days = [p["day"] for p in points]
+        still_open = [100 - p["pct_decided"] for p in points]
+        n_total = points[0]["n_total"]
+        fig.add_trace(go.Scatter(
+            x=days,
+            y=still_open,
+            mode="lines",
+            name=f"{category} (n={n_total})",
+            line=dict(color=color_map.get(category, "#888"), width=3),
+            hovertemplate=(
+                f"<b>{category}</b><br>Day %{{x}}: %{{y:.0f}}%% still open<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=300,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF"),
+        xaxis=dict(
+            title="Days since inquiry",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+        ),
+        yaxis=dict(
+            title="% still undecided",
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+            range=[0, 100],
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    return fig
+
+
 def get_dj_initials(dj_name):
     """Convert DJ full name to initials."""
     if not dj_name or dj_name == "Unassigned":
@@ -1047,10 +1434,18 @@ def main():
             sub_col1, sub_col2 = st.columns(2)
             with sub_col1:
                 booked = metrics.get("booked", 0)
-                canceled = metrics.get("canceled_pre_dedup_2026", 0)
+                canceled_post = metrics.get("canceled_post_booking_2026", 0)
+                canceled_pre = metrics.get("canceled_pre_booking_2026", 0)
                 st.metric("Booked", booked)
-                if canceled > 0:
-                    st.caption(f"{canceled} canceled after booking (peak: {booked + canceled})")
+                caption_lines = []
+                if canceled_post > 0:
+                    caption_lines.append(
+                        f"{canceled_post} canceled after booking (peak: {booked + canceled_post})"
+                    )
+                if canceled_pre > 0:
+                    caption_lines.append(f"{canceled_pre} canceled before booking")
+                if caption_lines:
+                    st.caption(" • ".join(caption_lines))
                 st.metric("Didn't Book", metrics.get("didnt_book", 0))
             with sub_col2:
                 st.metric("Full/Turn-away", metrics.get("full", 0) + metrics.get("we_turn_down", 0))
@@ -1315,11 +1710,170 @@ def main():
                 st.dataframe(dtd_df, hide_index=True, use_container_width=True)
     else:
         st.info("Lead time data requires both Inquiry Date and Decision Date fields")
-    
+
+    # ==========================================================================
+    # ROW 7: Pipeline Velocity (8-week trailing window, weekly cadence)
+    # ==========================================================================
+
+    st.divider()
+    st.subheader("⚡ Pipeline Velocity")
+    st.caption(
+        f"(Qualified opps × ${AVG_DEAL_SIZE:,} avg deal × win rate) ÷ avg cycle days. "
+        "Weekly snapshots over the last 6 months, each computed on a trailing 8-week window."
+    )
+
+    velocity_weekly = []
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            velocity_weekly = calculate_velocity_weekly(inquiry_df)
+        except Exception as e:
+            st.caption(f"Velocity calc failed: {str(e)[:100]}")
+
+    if velocity_weekly:
+        latest = velocity_weekly[-1]
+        # Compare to ~1 month back (4 weekly snapshots)
+        prior = velocity_weekly[-5] if len(velocity_weekly) >= 5 else velocity_weekly[0]
+
+        v_col1, v_col2, v_col3 = st.columns(3)
+        with v_col1:
+            delta = latest["velocity_dollars_per_day"] - prior["velocity_dollars_per_day"]
+            st.metric(
+                "Velocity (this week)",
+                f"${latest['velocity_dollars_per_day']:,.0f}/day",
+                delta=f"{delta:+,.0f}/day vs 4 wk ago" if abs(delta) >= 1 else None,
+            )
+        with v_col2:
+            st.metric("Win rate (window)", f"{latest['win_rate_pct']:.0f}%")
+        with v_col3:
+            st.metric("Avg cycle (window)", f"{latest['avg_cycle_days']:.0f} days")
+
+        v_chart = create_velocity_chart(velocity_weekly)
+        if v_chart:
+            st.plotly_chart(v_chart, use_container_width=True)
+    else:
+        st.info("Not enough decided inquiries to compute velocity")
+
+    # ==========================================================================
+    # ROW 8: Conversion by Lead Time at Inquiry
+    # ==========================================================================
+
+    st.divider()
+    st.subheader("📅 Conversion by Lead Time at Inquiry (2026)")
+    st.caption(
+        "How far out a couple was from their event when they inquired vs. how often they "
+        "booked and how fast they decided. Excludes Full / Turn-away from the denominator."
+    )
+
+    lead_buckets = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            lead_buckets = calculate_lead_time_buckets(inquiry_df)
+        except Exception as e:
+            st.caption(f"Bucket calc failed: {str(e)[:100]}")
+
+    if lead_buckets:
+        lt_col1, lt_col2 = st.columns([3, 2])
+
+        with lt_col1:
+            lt_chart = create_lead_time_bucket_chart(lead_buckets)
+            if lt_chart:
+                st.plotly_chart(lt_chart, use_container_width=True)
+
+        with lt_col2:
+            st.markdown("**Decision speed by bucket**")
+            speed_rows = []
+            for b in LEAD_TIME_BUCKETS:
+                if b not in lead_buckets:
+                    continue
+                data = lead_buckets[b]
+                speed_rows.append({
+                    "Lead time": b,
+                    "Median days": f"{data['median_days_to_decision']:.0f}",
+                    "Booked / Eligible": f"{data['booked']}/{data['eligible']}",
+                })
+            if speed_rows:
+                st.dataframe(
+                    pd.DataFrame(speed_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+    else:
+        st.info("No lead-time bucket data available")
+
+    # ==========================================================================
+    # ROW 9: Days to Decision by Lead Source
+    # ==========================================================================
+
+    st.divider()
+    st.subheader("🎯 Decision Velocity by Lead Source (2026)")
+    st.caption(
+        "How fast leads from each source actually decide. Sources with fewer than "
+        "3 decisions are hidden."
+    )
+
+    source_dtd = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            source_dtd = calculate_days_to_decision_by_source(inquiry_df)
+        except Exception as e:
+            st.caption(f"Source calc failed: {str(e)[:100]}")
+
+    if source_dtd:
+        source_rows = []
+        for source, data in source_dtd.items():
+            source_rows.append({
+                "Source": source[:30],
+                "Median days (booked)": (
+                    f"{data['median_days_booked']:.0f}"
+                    if data["median_days_booked"] is not None else "—"
+                ),
+                "Median days (all)": f"{data['median_days_all']:.0f}",
+                "Booked / Total": f"{data['booked_count']}/{data['count']}",
+            })
+
+        # Sort by booked-median ascending; sources with no bookings sink to the bottom
+        def sort_key(r):
+            v = r["Median days (booked)"]
+            return float(v) if v != "—" else float("inf")
+
+        source_rows.sort(key=sort_key)
+        st.dataframe(
+            pd.DataFrame(source_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No source data available")
+
+    # ==========================================================================
+    # ROW 10: Survival / Decision Curve
+    # ==========================================================================
+
+    st.divider()
+    st.subheader("📉 Decision Curve (2026)")
+    st.caption(
+        "Of couples who eventually booked or were lost, what % were still undecided "
+        "at day N. Booked drops fast; Lost takes longer."
+    )
+
+    survival = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            survival = calculate_survival_curve(inquiry_df)
+        except Exception as e:
+            st.caption(f"Survival calc failed: {str(e)[:100]}")
+
+    if survival and (survival.get("Booked") or survival.get("Lost")):
+        s_chart = create_survival_curve_chart(survival)
+        if s_chart:
+            st.plotly_chart(s_chart, use_container_width=True)
+    else:
+        st.info("No survival data available")
+
     # ==========================================================================
     # Footer
     # ==========================================================================
-    
+
     st.divider()
     st.caption("Big Fun DJ Operations Dashboard • Data refreshes hourly • Click 🔄 to force refresh")
 
