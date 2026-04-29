@@ -1178,6 +1178,58 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     }
 
 
+# Capacity-status values from the Inquiry Tracker form. Encoded here so the
+# transform doesn't need to query the form's allowed-value list at runtime.
+FULL_REASON_TRUE_CAPACITY = "True Capacity"
+FULL_REASON_ARTIFICIAL_CAP = "Artificial Cap (capacity known)"
+FULL_REASON_AAG_HOLD = "Artificial Cap (holding for AAG)"
+
+
+def calculate_full_reasons(df, event_year=2026, full_reason_col="Capacity Status (if Full)"):
+    """
+    Break Resolution=Full rows into True Capacity vs Artificial Cap reasons,
+    plus an opportunity-cost dollar estimate for the artificial-cap subset.
+
+    The two Artificial Cap variants represent dates we declined to take rather
+    than dates we couldn't take — capacity exists but we chose not to use it.
+    Multiplying the artificial count by AVG_DEAL_SIZE gives a blunt
+    "policy-driven misses" number for hire-vs-policy conversations.
+
+    Returns {} if the source column is missing entirely (older form versions).
+    """
+    if full_reason_col not in df.columns:
+        return {}
+
+    full_rows = df[
+        (df["Resolution"] == "Full")
+        & df["Event Date"].apply(lambda v: _is_year(v, event_year))
+    ]
+    total_full = len(full_rows)
+    if total_full == 0:
+        return {
+            "breakdown": {},
+            "total_full": 0,
+            "true_capacity_total": 0,
+            "artificial_total": 0,
+            "artificial_potential_revenue": 0,
+            "unspecified_total": 0,
+        }
+
+    raw = full_rows[full_reason_col].astype(str).str.strip()
+    nonblank = raw[raw != ""]
+    breakdown = nonblank.value_counts().to_dict()
+
+    artificial_total = sum(v for k, v in breakdown.items() if k.startswith("Artificial Cap"))
+    return {
+        "breakdown": breakdown,
+        "total_full": total_full,
+        "true_capacity_total": int(breakdown.get(FULL_REASON_TRUE_CAPACITY, 0)),
+        "artificial_total": artificial_total,
+        "artificial_potential_revenue": artificial_total * AVG_DEAL_SIZE,
+        "unspecified_total": total_full - sum(breakdown.values()),
+    }
+
+
 # =============================================================================
 # CHARTS FOR NEW METRICS
 # =============================================================================
@@ -1301,6 +1353,69 @@ def create_survival_curve_chart(curves):
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified",
+    )
+    return fig
+
+
+def create_full_reason_chart(full_reasons):
+    """Bar chart of Full reasons with artificial caps colored as opportunity cost."""
+    if not full_reasons or not full_reasons.get("breakdown"):
+        return None
+
+    breakdown = dict(full_reasons["breakdown"])
+    unspecified = full_reasons.get("unspecified_total", 0)
+    if unspecified > 0:
+        breakdown["(unspecified)"] = unspecified
+
+    # Order: True Capacity first (real), Artificial Caps next (opportunity), Unspecified last.
+    order = [
+        FULL_REASON_TRUE_CAPACITY,
+        FULL_REASON_ARTIFICIAL_CAP,
+        FULL_REASON_AAG_HOLD,
+        "(unspecified)",
+    ]
+    labels = [k for k in order if k in breakdown]
+    values = [breakdown[k] for k in labels]
+
+    color_map = {
+        FULL_REASON_TRUE_CAPACITY: "#888888",        # neutral — real capacity
+        FULL_REASON_ARTIFICIAL_CAP: "#FFB347",       # opportunity cost
+        FULL_REASON_AAG_HOLD: "#FF8C42",             # opportunity cost (slightly darker)
+        "(unspecified)": "#444444",                  # very muted — data hygiene
+    }
+    colors = [color_map[k] for k in labels]
+
+    # Shorten labels for the x-axis
+    display_labels = [
+        "True Capacity" if k == FULL_REASON_TRUE_CAPACITY
+        else "Artificial Cap (known)" if k == FULL_REASON_ARTIFICIAL_CAP
+        else "Artificial Cap (AAG hold)" if k == FULL_REASON_AAG_HOLD
+        else k
+        for k in labels
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=display_labels,
+        y=values,
+        marker_color=colors,
+        text=values,
+        textposition="auto",
+        hovertemplate="<b>%{x}</b><br>%{y} events<extra></extra>",
+    ))
+    fig.update_layout(
+        height=260,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF"),
+        xaxis=dict(title="Reason"),
+        yaxis=dict(
+            title="Events",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+        ),
+        showlegend=False,
     )
     return fig
 
@@ -1869,6 +1984,52 @@ def main():
             st.plotly_chart(s_chart, use_container_width=True)
     else:
         st.info("No survival data available")
+
+    # ==========================================================================
+    # ROW 11: Capacity Reality (Full reasons)
+    # ==========================================================================
+
+    st.divider()
+    st.subheader("🏗️ Capacity Reality (2026)")
+    st.caption(
+        "Splits Full events into True Capacity (we genuinely had no DJ available) "
+        "vs Artificial Cap (we declined the date despite having capacity, including "
+        "dates held for AAG). Artificial caps represent revenue we chose not to take."
+    )
+
+    full_reasons = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            full_reasons = calculate_full_reasons(inquiry_df)
+        except Exception as e:
+            st.caption(f"Capacity Reality calc failed: {str(e)[:100]}")
+
+    if full_reasons and full_reasons.get("total_full", 0) > 0:
+        cap_col1, cap_col2, cap_col3 = st.columns(3)
+        with cap_col1:
+            st.metric("Total Full (2026)", full_reasons["total_full"])
+            unspec = full_reasons.get("unspecified_total", 0)
+            if unspec > 0:
+                st.caption(f"{unspec} unspecified — fill in the form for cleaner data")
+        with cap_col2:
+            artificial = full_reasons["artificial_total"]
+            true_cap = full_reasons["true_capacity_total"]
+            st.metric("Artificial Cap", artificial)
+            if artificial + true_cap > 0:
+                share = artificial / (artificial + true_cap) * 100
+                st.caption(f"{share:.0f}% of specified Fulls are policy-driven")
+        with cap_col3:
+            st.metric(
+                "Potential revenue declined",
+                f"${full_reasons['artificial_potential_revenue']:,.0f}",
+            )
+            st.caption(f"= {artificial} × ${AVG_DEAL_SIZE:,} avg deal")
+
+        cap_chart = create_full_reason_chart(full_reasons)
+        if cap_chart:
+            st.plotly_chart(cap_chart, use_container_width=True)
+    else:
+        st.info("No 2026 Full events to analyze yet")
 
     # ==========================================================================
     # Footer

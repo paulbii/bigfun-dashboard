@@ -20,6 +20,7 @@ from dashboard import (  # noqa: E402
     LEAD_TIME_BUCKETS,
     _bucket_lead_time,
     calculate_days_to_decision_by_source,
+    calculate_full_reasons,
     calculate_lead_time_buckets,
     calculate_survival_curve,
     calculate_velocity_weekly,
@@ -273,6 +274,96 @@ def test_survival_curve_handles_empty_df():
     df = pd.DataFrame(columns=["Event Date", "Inquiry Date", "Decision Date", "Resolution"])
     out = calculate_survival_curve(df)
     assert out == {"Booked": [], "Lost": []}
+
+
+# -- calculate_full_reasons -------------------------------------------------
+
+def _full_row(event_date, capacity_status):
+    return {
+        "Event Date": event_date,
+        "Resolution": "Full",
+        "Capacity Status (if Full)": capacity_status,
+        "Inquiry Date": "",
+        "Decision Date": "",
+        "Initial Contact": "",
+        "Venue (if known)": "",
+        "Level of interaction": "",
+    }
+
+
+def test_full_reasons_groups_three_categories():
+    df = pd.DataFrame([
+        _full_row("12/15/26", "True Capacity"),
+        _full_row("12/15/26", "True Capacity"),
+        _full_row("12/15/26", "Artificial Cap (capacity known)"),
+        _full_row("12/15/26", "Artificial Cap (holding for AAG)"),
+    ])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out["total_full"] == 4
+    assert out["breakdown"]["True Capacity"] == 2
+    assert out["breakdown"]["Artificial Cap (capacity known)"] == 1
+    assert out["breakdown"]["Artificial Cap (holding for AAG)"] == 1
+    assert out["true_capacity_total"] == 2
+    assert out["artificial_total"] == 2
+    assert out["artificial_potential_revenue"] == 2 * AVG_DEAL_SIZE
+    assert out["unspecified_total"] == 0
+
+
+def test_full_reasons_counts_unspecified_separately():
+    df = pd.DataFrame([
+        _full_row("12/15/26", "True Capacity"),
+        _full_row("12/15/26", ""),
+        _full_row("12/15/26", "  "),
+    ])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out["total_full"] == 3
+    assert out["true_capacity_total"] == 1
+    assert out["artificial_total"] == 0
+    assert out["unspecified_total"] == 2
+
+
+def test_full_reasons_filters_other_event_years():
+    df = pd.DataFrame([
+        _full_row("12/15/27", "True Capacity"),  # 2027 event
+        _full_row("12/15/26", "Artificial Cap (capacity known)"),
+    ])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out["total_full"] == 1
+    assert out["artificial_total"] == 1
+
+
+def test_full_reasons_ignores_non_full_resolutions():
+    df = pd.DataFrame([
+        _full_row("12/15/26", "True Capacity"),
+        # A Booked row that happens to have Capacity Status filled — ignore it.
+        {**_full_row("12/15/26", "Artificial Cap (capacity known)"), "Resolution": "Booked"},
+    ])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out["total_full"] == 1
+
+
+def test_full_reasons_empty_df():
+    df = pd.DataFrame(columns=["Event Date", "Resolution", "Capacity Status (if Full)"])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out == {
+        "breakdown": {},
+        "total_full": 0,
+        "true_capacity_total": 0,
+        "artificial_total": 0,
+        "artificial_potential_revenue": 0,
+        "unspecified_total": 0,
+    }
+
+
+def test_full_reasons_missing_column_returns_empty():
+    df = pd.DataFrame([{
+        "Event Date": "12/15/26",
+        "Resolution": "Full",
+        "Inquiry Date": "",
+        "Decision Date": "",
+    }])
+    out = calculate_full_reasons(df, event_year=2026)
+    assert out == {}
 
 
 # -- bucket order constant -------------------------------------------------
