@@ -37,9 +37,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# BIG FUN's average event revenue (context/work.md). Used as the deal-size
-# constant in the pipeline-velocity formula.
-AVG_DEAL_SIZE = 2100
+# BIG FUN's standard event rate (post-January-2026 schedule). The modal and
+# median rate from a sample of 63 events booked at the new rates. The mean of
+# the same sample is $2,231 — lower because some events get policy-driven
+# discounts (school events, shorter packages) that shouldn't dilute the
+# typical-wedding baseline. Used as the deal-size constant in the
+# pipeline-velocity formula and for "potential declined revenue" framing.
+AVG_DEAL_SIZE = 2299
 
 LEAD_TIME_BUCKETS = ["<3 mo", "3-6 mo", "6-12 mo", "12+ mo"]
 
