@@ -1060,6 +1060,17 @@ def _is_year(value, year):
     return pd.notna(dt) and dt.year == year
 
 
+def _is_aag_handoff(row) -> bool:
+    """True if the row is a venue-routed handoff (administrative booking, not
+    a sales event). For now this is almost always Allied Arts Guild — the only
+    venue with an exclusive in-house DJ arrangement that routes couples to us
+    without a sales conversation. See memory/reference_aag_venue_handoffs.md.
+    """
+    initial = str(row.get("Initial Contact", "")).strip()
+    interaction = str(row.get("Level of interaction", "")).strip().lower()
+    return initial == "Venue" and interaction == "never acknowledged"
+
+
 def _iter_dated_rows(df, event_year=None):
     """Yield dicts for rows that have both Inquiry Date and Decision Date parsed."""
     for _, row in df.iterrows():
@@ -1076,13 +1087,17 @@ def _iter_dated_rows(df, event_year=None):
             "decision_dt": decision_dt,
             "resolution": str(row.get("Resolution", "")).strip(),
             "source": str(row.get("Initial Contact", "")).strip(),
+            "is_aag_handoff": _is_aag_handoff(row),
         }
 
 
 def calculate_lead_time_buckets(df, event_year=2026):
-    """Conversion rate and decision velocity per lead-time-at-inquiry bucket."""
+    """Conversion rate and decision velocity per lead-time-at-inquiry bucket.
+    AAG venue handoffs excluded — they're admin bookings, not sales events."""
     rows = []
     for r in _iter_dated_rows(df, event_year):
+        if r["is_aag_handoff"]:
+            continue
         if pd.isna(r["event_dt"]):
             continue
         lead_days = (r["event_dt"] - r["inquiry_dt"]).days
@@ -1121,9 +1136,12 @@ def calculate_lead_time_buckets(df, event_year=2026):
 
 
 def calculate_days_to_decision_by_source(df, event_year=2026, min_count=3):
-    """Days-to-decision per Initial Contact source. Filters out sources with < min_count rows."""
+    """Days-to-decision per Initial Contact source. Filters out sources with < min_count rows.
+    AAG venue handoffs excluded — they'd dominate the 'Venue' source with admin-booking noise."""
     rows = []
     for r in _iter_dated_rows(df, event_year):
+        if r["is_aag_handoff"]:
+            continue
         days = (r["decision_dt"] - r["inquiry_dt"]).days
         if days < 0:
             continue
@@ -1163,6 +1181,8 @@ def calculate_velocity_weekly(df, weeks=26, window_weeks=8, avg_deal_size=AVG_DE
     """
     rows = []
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         inq = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
         dec = pd.to_datetime(row.get("Decision Date"), errors="coerce")
         if pd.isna(inq) or pd.isna(dec):
@@ -1216,6 +1236,8 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     bookers = []
     losers = []
     for r in _iter_dated_rows(df, event_year):
+        if r["is_aag_handoff"]:
+            continue
         days = (r["decision_dt"] - r["inquiry_dt"]).days
         if days < 0:
             continue
@@ -1259,6 +1281,8 @@ def calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=120):
     """
     bookers_by_bucket: dict[str, list[int]] = {b: [] for b in LEAD_TIME_BUCKETS}
     for r in _iter_dated_rows(df, event_year):
+        if r["is_aag_handoff"]:
+            continue
         if r["resolution"] != "Booked":
             continue
         if pd.isna(r["event_dt"]):
@@ -1363,6 +1387,8 @@ def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
     aren't diluted by school events, single-org recurring bookings, etc."""
     rows = []
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         inquiry_dt = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
@@ -1413,6 +1439,8 @@ def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=2026):
     wedding sales pipeline only."""
     rows = []
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
@@ -1447,6 +1475,8 @@ def find_research_targets(venues, tier_lookup, df, event_year=2026):
     so the operator can prioritize venues sending us business."""
     inquiry_counts = {}
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
@@ -1477,6 +1507,8 @@ def find_outreach_targets(venues, tier_lookup, df, event_year=2026):
     confirmed outreach candidates."""
     inquiry_counts = {}
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
@@ -1508,6 +1540,8 @@ def calculate_growth_target_activity(venues, tier_lookup, df, event_year=2026):
     Lets Paul see whether his investment in those venues is showing up."""
     counts = {}
     for _, row in df.iterrows():
+        if _is_aag_handoff(row):
+            continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)

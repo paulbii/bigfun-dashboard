@@ -334,6 +334,76 @@ def test_survival_by_lead_time_cdf_progression_per_bucket():
     assert all(p["n_total"] == 2 for p in short)
 
 
+def _aag_handoff_row(event_date, inquiry_date, decision_date, venue="Allied Arts Guild"):
+    """An AAG-style venue handoff: Initial Contact=Venue, Level=Never acknowledged.
+    Resolution is Booked (those handoffs almost always book)."""
+    return {
+        "Event Date": event_date,
+        "Inquiry Date": inquiry_date,
+        "Decision Date": decision_date,
+        "Resolution": "Booked",
+        "Venue (if known)": venue,
+        "Initial Contact": "Venue",
+        "Level of interaction": "Never acknowledged",
+    }
+
+
+def test_aag_handoffs_excluded_from_lead_time_buckets():
+    df = pd.DataFrame([
+        # Real wedding inquiry (included)
+        _row("12/15/26", "2026-11-15", "2026-11-20", "Booked", source="Knot"),
+        # AAG handoff (excluded)
+        _aag_handoff_row("12/16/26", "2026-11-16", "2026-11-16"),
+    ])
+    out = calculate_lead_time_buckets(df, event_year=2026)
+    total = sum(b["count"] for b in out.values())
+    assert total == 1  # AAG handoff excluded
+
+
+def test_aag_handoffs_excluded_from_survival_curve():
+    df = pd.DataFrame([
+        _row("12/15/26", "2026-11-01", "2026-11-15", "Booked", source="Knot"),
+        _aag_handoff_row("12/15/26", "2026-11-01", "2026-11-01"),  # excluded
+    ])
+    out = calculate_survival_curve(df, event_year=2026, max_days=30)
+    assert out["Booked"][0]["n_total"] == 1
+
+
+def test_aag_handoffs_excluded_from_survival_curve_by_lead_time():
+    df = pd.DataFrame([
+        _row("12/15/26", "2026-11-01", "2026-11-15", "Booked", source="Knot"),
+        _aag_handoff_row("12/15/26", "2026-11-01", "2026-11-01"),  # excluded
+    ])
+    out = calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=30)
+    # Both rows are short-lead, but AAG handoff filtered out
+    assert out["<3 mo"][0]["n_total"] == 1
+
+
+def test_aag_handoffs_excluded_from_velocity():
+    today = pd.Timestamp.now().normalize()
+    rows = [
+        # 2 real bookings
+        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Knot", "Venue (if known)": "Nestldown", "Level of interaction": "Meaningful email interaction"},
+        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=4)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Knot", "Venue (if known)": "Nestldown", "Level of interaction": "Meaningful email interaction"},
+        # AAG handoff (excluded)
+        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Venue", "Venue (if known)": "Allied Arts Guild", "Level of interaction": "Never acknowledged"},
+    ]
+    df = pd.DataFrame(rows)
+    out = calculate_velocity_weekly(df, weeks=1, window_weeks=4)
+    assert out[-1]["opps"] == 2  # AAG handoff excluded
+
+
+def test_aag_handoffs_excluded_from_metrics_by_tier():
+    venues = [_venue("Nestldown", tier="Tier 1"), _venue("Allied Arts Guild", tier="Tier 1")]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "Nestldown", "Booked"),
+        _aag_handoff_row("12/16/26", "2026-12-06", "2026-12-06"),  # AAG handoff
+    ])
+    out = calculate_metrics_by_tier(df, lookup, event_year=2026)
+    assert out["Tier 1"]["count"] == 1  # AAG handoff filtered
+
+
 def test_survival_by_lead_time_handles_empty_df():
     df = pd.DataFrame(columns=["Event Date", "Inquiry Date", "Decision Date", "Resolution"])
     out = calculate_survival_curve_by_lead_time(df)
