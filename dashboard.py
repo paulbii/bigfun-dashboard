@@ -1654,21 +1654,16 @@ def create_survival_curve_chart(curves):
 
 
 def create_full_reason_chart(full_reasons):
-    """Bar chart of Full reasons with artificial caps colored as opportunity cost."""
+    """Bar chart of Full reasons with artificial caps colored as opportunity cost.
+    Pre-tracking ('unspecified') Full events are excluded from the chart."""
     if not full_reasons or not full_reasons.get("breakdown"):
         return None
 
-    breakdown = dict(full_reasons["breakdown"])
-    unspecified = full_reasons.get("unspecified_total", 0)
-    if unspecified > 0:
-        breakdown["(unspecified)"] = unspecified
-
-    # Order: True Capacity first (real), Artificial Caps next (opportunity), Unspecified last.
+    breakdown = full_reasons["breakdown"]
     order = [
         FULL_REASON_TRUE_CAPACITY,
         FULL_REASON_ARTIFICIAL_CAP,
         FULL_REASON_AAG_HOLD,
-        "(unspecified)",
     ]
     labels = [k for k in order if k in breakdown]
     values = [breakdown[k] for k in labels]
@@ -1677,16 +1672,13 @@ def create_full_reason_chart(full_reasons):
         FULL_REASON_TRUE_CAPACITY: "#888888",        # neutral — real capacity
         FULL_REASON_ARTIFICIAL_CAP: "#FFB347",       # opportunity cost
         FULL_REASON_AAG_HOLD: "#FF8C42",             # opportunity cost (slightly darker)
-        "(unspecified)": "#444444",                  # very muted — data hygiene
     }
     colors = [color_map[k] for k in labels]
 
-    # Shorten labels for the x-axis
     display_labels = [
         "True Capacity" if k == FULL_REASON_TRUE_CAPACITY
         else "Artificial Cap (known)" if k == FULL_REASON_ARTIFICIAL_CAP
-        else "Artificial Cap (AAG hold)" if k == FULL_REASON_AAG_HOLD
-        else k
+        else "Artificial Cap (AAG hold)"
         for k in labels
     ]
 
@@ -2303,17 +2295,18 @@ def main():
     if full_reasons and full_reasons.get("total_full", 0) > 0:
         cap_col1, cap_col2, cap_col3 = st.columns(3)
         with cap_col1:
-            st.metric("Total Full (2026)", full_reasons["total_full"])
+            categorized = full_reasons["true_capacity_total"] + full_reasons["artificial_total"]
+            st.metric("Categorized Full (2026)", categorized)
             unspec = full_reasons.get("unspecified_total", 0)
             if unspec > 0:
-                st.caption(f"{unspec} unspecified — fill in the form for cleaner data")
+                st.caption(f"({unspec} additional Full rows predate the Capacity Status field)")
         with cap_col2:
             artificial = full_reasons["artificial_total"]
             true_cap = full_reasons["true_capacity_total"]
             st.metric("Artificial Cap", artificial)
             if artificial + true_cap > 0:
                 share = artificial / (artificial + true_cap) * 100
-                st.caption(f"{share:.0f}% of specified Fulls are policy-driven")
+                st.caption(f"{share:.0f}% of categorized Fulls are policy-driven")
         with cap_col3:
             st.metric(
                 "Potential revenue declined",
