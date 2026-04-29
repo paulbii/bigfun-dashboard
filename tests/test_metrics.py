@@ -27,6 +27,7 @@ from dashboard import (  # noqa: E402
     calculate_metrics_by_recommended_status,
     calculate_metrics_by_tier,
     calculate_survival_curve,
+    calculate_survival_curve_by_lead_time,
     calculate_velocity_weekly,
     find_outreach_targets,
     find_research_targets,
@@ -282,6 +283,61 @@ def test_survival_curve_handles_empty_df():
     df = pd.DataFrame(columns=["Event Date", "Inquiry Date", "Decision Date", "Resolution"])
     out = calculate_survival_curve(df)
     assert out == {"Booked": [], "Lost": []}
+
+
+# -- calculate_survival_curve_by_lead_time --------------------------------
+
+def test_survival_by_lead_time_groups_bookers_by_bucket():
+    df = pd.DataFrame([
+        # Short-lead booker: inquired ~30 days out, decided in 4 days
+        _row("12/15/26", "2026-11-15", "2026-11-19", "Booked"),
+        # Long-lead booker: inquired ~14 months out, decided in 14 days
+        _row("12/15/26", "2025-10-01", "2025-10-15", "Booked"),
+        # Lost: should not appear in any curve
+        _row("12/15/26", "2026-09-01", "2026-09-30", "Cold"),
+    ])
+    out = calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=30)
+
+    # Short-lead bucket present; long-lead bucket present
+    assert "<3 mo" in out
+    assert "12+ mo" in out
+    # Each has exactly one booker
+    assert out["<3 mo"][0]["n_total"] == 1
+    assert out["12+ mo"][0]["n_total"] == 1
+
+
+def test_survival_by_lead_time_excludes_lost_outcomes():
+    df = pd.DataFrame([
+        _row("12/15/26", "2026-11-15", "2026-11-19", "Booked"),  # included
+        _row("12/15/26", "2026-11-15", "2026-11-19", "Cold"),    # excluded
+        _row("12/15/26", "2026-11-15", "2026-11-19", "Didn't Book"),  # excluded
+    ])
+    out = calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=30)
+    assert out["<3 mo"][0]["n_total"] == 1
+
+
+def test_survival_by_lead_time_cdf_progression_per_bucket():
+    df = pd.DataFrame([
+        # Two short-lead bookers: one decides at day 2, one at day 10
+        _row("12/15/26", "2026-11-15", "2026-11-17", "Booked"),
+        _row("12/15/26", "2026-11-15", "2026-11-25", "Booked"),
+    ])
+    out = calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=30)
+    short = out["<3 mo"]
+    # Day 0: nobody decided yet (0%)
+    assert short[0]["pct_decided"] == 0
+    # Day 2: one of two decided (50%)
+    assert abs(short[2]["pct_decided"] - 50) < 0.001
+    # Day 10: both decided (100%)
+    assert abs(short[10]["pct_decided"] - 100) < 0.001
+    # n_total stays constant
+    assert all(p["n_total"] == 2 for p in short)
+
+
+def test_survival_by_lead_time_handles_empty_df():
+    df = pd.DataFrame(columns=["Event Date", "Inquiry Date", "Decision Date", "Resolution"])
+    out = calculate_survival_curve_by_lead_time(df)
+    assert out == {}
 
 
 # -- calculate_full_reasons -------------------------------------------------

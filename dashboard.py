@@ -1248,6 +1248,54 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     }
 
 
+def calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=120):
+    """For each lead-time-at-inquiry bucket, the cumulative % of bookers in
+    that bucket who have decided by day N. Used to set bucket-specific
+    stale-lead thresholds — short-lead couples decide faster than long-lead
+    ones, so a single global threshold mis-fits both ends.
+
+    Only bookers are tracked; the lost cohort would add visual noise to what's
+    primarily a "when can I stop chasing" question.
+    """
+    bookers_by_bucket: dict[str, list[int]] = {b: [] for b in LEAD_TIME_BUCKETS}
+    for r in _iter_dated_rows(df, event_year):
+        if r["resolution"] != "Booked":
+            continue
+        if pd.isna(r["event_dt"]):
+            continue
+        lead_days = (r["event_dt"] - r["inquiry_dt"]).days
+        if lead_days < 0:
+            continue
+        bucket = _bucket_lead_time(lead_days)
+        if bucket is None:
+            continue
+        decision_days = (r["decision_dt"] - r["inquiry_dt"]).days
+        if decision_days < 0:
+            continue
+        bookers_by_bucket[bucket].append(decision_days)
+
+    curves: dict[str, list[dict]] = {}
+    for bucket, days_list in bookers_by_bucket.items():
+        if not days_list:
+            continue
+        sorted_days = sorted(days_list)
+        n = len(sorted_days)
+        curve = []
+        idx = 0
+        for d in range(0, max_days + 1):
+            while idx < n and sorted_days[idx] <= d:
+                idx += 1
+            curve.append({
+                "day": d,
+                "pct_decided": idx / n * 100,
+                "n_decided": idx,
+                "n_total": n,
+            })
+        curves[bucket] = curve
+
+    return curves
+
+
 def normalize_venue_name(name):
     """Normalize a venue name for lookup: strip trailing parens, lowercase,
     remove punctuation, collapse whitespace. Matches the Inquiry Tracker's
@@ -1656,6 +1704,64 @@ def create_survival_curve_chart(curves):
         ),
         yaxis=dict(
             title="% still undecided",
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+            range=[0, 100],
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def create_survival_curve_by_lead_time_chart(curves):
+    """Multi-line survival curve, one per lead-time-at-inquiry bucket.
+    Y-axis = % of that bucket's bookers still undecided at day N."""
+    if not curves:
+        return None
+
+    fig = go.Figure()
+    color_map = {
+        "<3 mo": "#FF6B6B",       # red — fastest decisions expected
+        "3-6 mo": "#FFB347",      # orange
+        "6-12 mo": "#4ECDC4",     # teal
+        "12+ mo": "#7B68EE",      # purple — slowest decisions expected
+    }
+
+    for bucket in LEAD_TIME_BUCKETS:
+        if bucket not in curves:
+            continue
+        points = curves[bucket]
+        if not points:
+            continue
+        days = [p["day"] for p in points]
+        still_open = [100 - p["pct_decided"] for p in points]
+        n_total = points[0]["n_total"]
+        fig.add_trace(go.Scatter(
+            x=days,
+            y=still_open,
+            mode="lines",
+            name=f"{bucket} (n={n_total})",
+            line=dict(color=color_map.get(bucket, "#888"), width=3),
+            hovertemplate=(
+                f"<b>{bucket}</b><br>Day %{{x}}: %{{y:.0f}}%% still open<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=320,
+        margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#FFFFFF"),
+        xaxis=dict(
+            title="Days since inquiry",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.1)",
+        ),
+        yaxis=dict(
+            title="% of bookers still undecided",
             ticksuffix="%",
             showgrid=True,
             gridcolor="rgba(255,255,255,0.1)",
@@ -2286,6 +2392,32 @@ def main():
             st.plotly_chart(s_chart, use_container_width=True)
     else:
         st.info("No survival data available")
+
+    # ROW 10b: Decision Curve faceted by lead-time-at-inquiry bucket.
+    # Used for setting bucket-specific stale-lead thresholds in MailMaven.
+    st.divider()
+    st.subheader("📉 Decision Curve by Lead Time (2026 bookers)")
+    st.caption(
+        "Same survival curve, but split by how far out the couple was when "
+        "they inquired. Short-lead couples decide faster than long-lead ones — "
+        "so 'when can I stop chasing' should vary by bucket. Read the day where "
+        "each curve flattens and use that as your stale-lead threshold for "
+        "that bucket."
+    )
+
+    survival_by_lt = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            survival_by_lt = calculate_survival_curve_by_lead_time(inquiry_df)
+        except Exception as e:
+            st.caption(f"Faceted survival calc failed: {str(e)[:100]}")
+
+    if survival_by_lt:
+        slt_chart = create_survival_curve_by_lead_time_chart(survival_by_lt)
+        if slt_chart:
+            st.plotly_chart(slt_chart, use_container_width=True)
+    else:
+        st.info("No bucket-faceted survival data available")
 
     # ==========================================================================
     # ROW 11: Capacity Reality (Full reasons)
