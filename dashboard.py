@@ -61,6 +61,7 @@ AIRTABLE_FIELD_FORMER_NAMES = "fldGsvjPqCRrhEdm1"
 AIRTABLE_FIELD_TIER = "fldeseALwwueuZmcF"
 AIRTABLE_FIELD_GROWTH_TARGET = "fld0ocfdRuSXnxp3M"
 AIRTABLE_FIELD_RECOMMENDED_STATUS = "fld0JQJ2kvyySfKuD"
+AIRTABLE_FIELD_WEDDING_VENUE = "fldt3DrdaWBnrYFsQ"
 
 # =============================================================================
 # AUTHENTICATION
@@ -129,6 +130,7 @@ def get_venue_tiers_from_airtable():
                 "tier": tier_str,
                 "growth_target": bool(f.get(AIRTABLE_FIELD_GROWTH_TARGET, False)),
                 "recommended_status": rec_status_str,
+                "wedding_venue": bool(f.get(AIRTABLE_FIELD_WEDDING_VENUE, False)),
             })
         offset = data.get("offset")
         if not offset:
@@ -1275,6 +1277,7 @@ def build_venue_tier_lookup(venues):
             "tier": v.get("tier", ""),
             "growth_target": bool(v.get("growth_target", False)),
             "recommended_status": v.get("recommended_status", "") or "Unknown",
+            "wedding_venue": bool(v.get("wedding_venue", True)),
         }
         key = normalize_venue_name(v["name"])
         if key and key not in lookup:
@@ -1301,12 +1304,15 @@ def venue_to_tier_info(name, lookup, default_tier="Tier 4"):
         "tier": default_tier,
         "growth_target": False,
         "recommended_status": "Unknown",
+        "wedding_venue": True,
     }
 
 
 def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
     """Conversion + decision velocity per tier. Tier 3 and Tier 4 are rolled
-    into 'Tier 3+' to keep sample sizes meaningful."""
+    into 'Tier 3+' to keep sample sizes meaningful. Inquiries at non-wedding
+    venues (Wedding Venue? unchecked) are excluded so wedding-pipeline numbers
+    aren't diluted by school events, single-org recurring bookings, etc."""
     rows = []
     for _, row in df.iterrows():
         if not _is_year(row.get("Event Date", ""), event_year):
@@ -1316,7 +1322,7 @@ def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
         if pd.isna(inquiry_dt) or pd.isna(decision_dt):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
-        if info is None:
+        if info is None or not info.get("wedding_venue", True):
             continue
         event_dt = _parse_event_date(row.get("Event Date", ""))
         rows.append({
@@ -1354,13 +1360,15 @@ def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
 
 
 def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=2026):
-    """Conversion sliced by Airtable's Recommended Status (5-value enum)."""
+    """Conversion sliced by Airtable's Recommended Status (5-value enum).
+    Excludes inquiries at non-wedding venues so the slicing reflects the
+    wedding sales pipeline only."""
     rows = []
     for _, row in df.iterrows():
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
         info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
-        if info is None:
+        if info is None or not info.get("wedding_venue", True):
             continue
         rows.append({
             "status": info["recommended_status"] or "Unknown",
@@ -1400,6 +1408,8 @@ def find_research_targets(venues, tier_lookup, df, event_year=2026):
 
     targets = []
     for v in venues or []:
+        if not v.get("wedding_venue", True):
+            continue
         if v.get("tier") not in ("Tier 1", "Tier 2"):
             continue
         status = (v.get("recommended_status") or "Unknown")
@@ -1429,6 +1439,8 @@ def find_outreach_targets(venues, tier_lookup, df, event_year=2026):
     NEGATIVE_STATUSES = {"Unlikely", "No, with hard evidence"}
     targets = []
     for v in venues or []:
+        if not v.get("wedding_venue", True):
+            continue
         if not v.get("growth_target"):
             continue
         if v.get("recommended_status") not in NEGATIVE_STATUSES:
@@ -1460,6 +1472,8 @@ def calculate_growth_target_activity(venues, tier_lookup, df, event_year=2026):
 
     out = []
     for v in venues or []:
+        if not v.get("wedding_venue", True):
+            continue
         if not v.get("growth_target"):
             continue
         c = counts.get(v["name"], {"inquiries": 0, "booked": 0})
@@ -2336,11 +2350,20 @@ def main():
         # ROW 12: Conversion by Venue Tier
         st.divider()
         st.subheader("🏛️ Conversion by Venue Tier (2026)")
-        st.caption(
-            "Slices conversion and decision velocity by venue tier "
-            "(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
-            "for sample-size discipline."
-        )
+        excluded_count = sum(1 for v in venues if not v.get("wedding_venue", True))
+        if excluded_count > 0:
+            st.caption(
+                f"Slices conversion and decision velocity by venue tier "
+                f"(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
+                f"for sample-size discipline. **{excluded_count} non-wedding venues** "
+                "(schools, single-org recurring, etc.) excluded from wedding-pipeline analytics."
+            )
+        else:
+            st.caption(
+                "Slices conversion and decision velocity by venue tier "
+                "(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
+                "for sample-size discipline."
+            )
         try:
             tier_metrics = calculate_metrics_by_tier(inquiry_df, tier_lookup)
         except Exception as e:

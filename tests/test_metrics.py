@@ -394,13 +394,14 @@ def test_normalize_lowercases_and_strips_punctuation():
 
 # -- build_venue_tier_lookup + venue_to_tier_info --------------------------
 
-def _venue(name, tier="Tier 4", growth_target=False, recommended_status="Unknown", former_names=""):
+def _venue(name, tier="Tier 4", growth_target=False, recommended_status="Unknown", former_names="", wedding_venue=True):
     return {
         "name": name,
         "tier": tier,
         "growth_target": growth_target,
         "recommended_status": recommended_status,
         "former_names": former_names,
+        "wedding_venue": wedding_venue,
     }
 
 
@@ -487,6 +488,58 @@ def test_metrics_by_tier_excludes_blank_venues():
     out = calculate_metrics_by_tier(df, lookup, event_year=2026)
     assert out["Tier 1"]["count"] == 1
     assert "Tier 3+" not in out
+
+
+def test_metrics_by_tier_excludes_non_wedding_venues():
+    """Schools, single-org recurring venues, etc. are excluded from wedding-pipeline analytics."""
+    venues = [
+        _venue("Nestldown", tier="Tier 1", wedding_venue=True),
+        _venue("Kennedy Middle School", tier="Tier 2", wedding_venue=False),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "Nestldown", "Booked"),
+        _inquiry_row("12/16/26", "Kennedy Middle School", "Booked"),  # excluded — not a wedding venue
+    ])
+    out = calculate_metrics_by_tier(df, lookup, event_year=2026)
+    assert out["Tier 1"]["count"] == 1
+    assert "Tier 2" not in out  # school inquiry filtered out
+
+
+def test_research_targets_excludes_non_wedding_venues():
+    venues = [
+        _venue("Wedding T2", tier="Tier 2", recommended_status="Unknown", wedding_venue=True),
+        _venue("School T2", tier="Tier 2", recommended_status="Unknown", wedding_venue=False),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([])
+    targets = find_research_targets(venues, lookup, df, event_year=2026)
+    names = {t["name"] for t in targets}
+    assert names == {"Wedding T2"}
+
+
+def test_outreach_targets_excludes_non_wedding_venues():
+    venues = [
+        _venue("Wedding GT", growth_target=True, recommended_status="No, with hard evidence", wedding_venue=True),
+        _venue("School GT", growth_target=True, recommended_status="No, with hard evidence", wedding_venue=False),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([])
+    targets = find_outreach_targets(venues, lookup, df, event_year=2026)
+    names = {t["name"] for t in targets}
+    assert names == {"Wedding GT"}
+
+
+def test_growth_target_activity_excludes_non_wedding_venues():
+    venues = [
+        _venue("Wedding GT", tier="Tier 2", growth_target=True, wedding_venue=True),
+        _venue("School GT", tier="Tier 2", growth_target=True, wedding_venue=False),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([])
+    out = calculate_growth_target_activity(venues, lookup, df, event_year=2026)
+    names = {v["name"] for v in out}
+    assert names == {"Wedding GT"}
 
 
 # -- calculate_metrics_by_recommended_status -------------------------------
