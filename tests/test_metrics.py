@@ -19,11 +19,19 @@ from dashboard import (  # noqa: E402
     AVG_DEAL_SIZE,
     LEAD_TIME_BUCKETS,
     _bucket_lead_time,
+    build_venue_tier_lookup,
     calculate_days_to_decision_by_source,
     calculate_full_reasons,
+    calculate_growth_target_activity,
     calculate_lead_time_buckets,
+    calculate_metrics_by_recommended_status,
+    calculate_metrics_by_tier,
     calculate_survival_curve,
     calculate_velocity_weekly,
+    find_outreach_targets,
+    find_research_targets,
+    normalize_venue_name,
+    venue_to_tier_info,
 )
 
 
@@ -364,6 +372,190 @@ def test_full_reasons_missing_column_returns_empty():
     }])
     out = calculate_full_reasons(df, event_year=2026)
     assert out == {}
+
+
+# -- normalize_venue_name --------------------------------------------------
+
+def test_normalize_strips_trailing_parens():
+    assert normalize_venue_name("Nestldown (NO FOG, NO TAPE)") == "nestldown"
+    assert normalize_venue_name("Kohl Mansion (FOG OK)") == "kohl mansion"
+
+
+def test_normalize_handles_empty():
+    assert normalize_venue_name("") == ""
+    assert normalize_venue_name(None) == ""
+    assert normalize_venue_name("   ") == ""
+
+
+def test_normalize_lowercases_and_strips_punctuation():
+    assert normalize_venue_name("CASA REAL!!") == "casa real"
+    assert normalize_venue_name("B.R. Cohn") == "b r cohn"
+
+
+# -- build_venue_tier_lookup + venue_to_tier_info --------------------------
+
+def _venue(name, tier="Tier 4", growth_target=False, recommended_status="Unknown", former_names=""):
+    return {
+        "name": name,
+        "tier": tier,
+        "growth_target": growth_target,
+        "recommended_status": recommended_status,
+        "former_names": former_names,
+    }
+
+
+def test_lookup_finds_canonical_and_former_names():
+    venues = [
+        _venue("Nestldown", tier="Tier 1", former_names="Nestldown (NO FOG, NO TAPE)"),
+        _venue("Casa Real", tier="Tier 2", former_names="Casa Real at Ruby Hill"),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    # Canonical match
+    info = venue_to_tier_info("Nestldown", lookup)
+    assert info["tier"] == "Tier 1"
+    # Trailing-paren variant maps via normalization
+    info = venue_to_tier_info("Nestldown (NO FOG, NO TAPE)", lookup)
+    assert info["tier"] == "Tier 1"
+    # Former-name match
+    info = venue_to_tier_info("Casa Real at Ruby Hill", lookup)
+    assert info["tier"] == "Tier 2"
+
+
+def test_lookup_unknown_defaults_to_tier_4():
+    lookup = build_venue_tier_lookup([_venue("Nestldown", tier="Tier 1")])
+    info = venue_to_tier_info("Some Random Venue", lookup)
+    assert info["tier"] == "Tier 4"
+
+
+def test_lookup_blank_returns_none():
+    lookup = build_venue_tier_lookup([_venue("Nestldown", tier="Tier 1")])
+    assert venue_to_tier_info("", lookup) is None
+    assert venue_to_tier_info(None, lookup) is None
+
+
+# -- calculate_metrics_by_tier ---------------------------------------------
+
+def _inquiry_row(event_date, venue, resolution, inquiry_offset_days=10, decision_offset_days=5):
+    """Helper: build an inquiry row 5 days after a 10-day-pre-event inquiry."""
+    from datetime import datetime, timedelta
+    event = datetime.strptime(event_date, "%m/%d/%y")
+    inquiry = event - timedelta(days=inquiry_offset_days)
+    decision = inquiry + timedelta(days=decision_offset_days)
+    return {
+        "Event Date": event_date,
+        "Inquiry Date": inquiry.strftime("%Y-%m-%d"),
+        "Decision Date": decision.strftime("%Y-%m-%d"),
+        "Resolution": resolution,
+        "Venue (if known)": venue,
+        "Initial Contact": "",
+        "Level of interaction": "",
+    }
+
+
+def test_metrics_by_tier_groups_and_rolls_tier_3_4():
+    venues = [
+        _venue("Nestldown", tier="Tier 1"),
+        _venue("Kennedy Middle School", tier="Tier 2"),
+        _venue("Random Hall", tier="Tier 3"),
+        _venue("Some Old Place", tier="Tier 4"),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "Nestldown", "Booked"),
+        _inquiry_row("12/16/26", "Kennedy Middle School", "Booked"),
+        _inquiry_row("12/17/26", "Kennedy Middle School", "Didn't Book"),
+        _inquiry_row("12/18/26", "Random Hall", "Booked"),
+        _inquiry_row("12/19/26", "Some Old Place", "Cold"),
+    ])
+    out = calculate_metrics_by_tier(df, lookup, event_year=2026)
+    assert out["Tier 1"]["count"] == 1
+    assert out["Tier 1"]["conversion_rate"] == 100.0
+    assert out["Tier 2"]["count"] == 2
+    assert out["Tier 2"]["conversion_rate"] == 50.0
+    # Tier 3 + Tier 4 rolled into Tier 3+
+    assert out["Tier 3+"]["count"] == 2
+    assert out["Tier 3+"]["booked"] == 1
+
+
+def test_metrics_by_tier_excludes_blank_venues():
+    venues = [_venue("Nestldown", tier="Tier 1")]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "Nestldown", "Booked"),
+        _inquiry_row("12/16/26", "", "Booked"),  # excluded
+    ])
+    out = calculate_metrics_by_tier(df, lookup, event_year=2026)
+    assert out["Tier 1"]["count"] == 1
+    assert "Tier 3+" not in out
+
+
+# -- calculate_metrics_by_recommended_status -------------------------------
+
+def test_metrics_by_recommended_status_groups():
+    venues = [
+        _venue("On List", recommended_status="Yes, with hard evidence"),
+        _venue("Off List", recommended_status="No, with hard evidence"),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "On List", "Booked"),
+        _inquiry_row("12/16/26", "On List", "Booked"),
+        _inquiry_row("12/17/26", "Off List", "Didn't Book"),
+    ])
+    out = calculate_metrics_by_recommended_status(df, lookup, event_year=2026)
+    assert out["Yes, with hard evidence"]["conversion_rate"] == 100.0
+    assert out["No, with hard evidence"]["conversion_rate"] == 0.0
+
+
+# -- find_research_targets / find_outreach_targets -------------------------
+
+def test_research_targets_only_T1_T2_with_unknown_status():
+    venues = [
+        _venue("T1 unknown", tier="Tier 1", recommended_status="Unknown"),
+        _venue("T1 known", tier="Tier 1", recommended_status="Yes, with hard evidence"),
+        _venue("T2 unknown", tier="Tier 2", recommended_status="Unknown"),
+        _venue("T3 unknown", tier="Tier 3", recommended_status="Unknown"),  # excluded
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([])  # no inquiries → counts all 0
+    targets = find_research_targets(venues, lookup, df, event_year=2026)
+    names = {t["name"] for t in targets}
+    assert names == {"T1 unknown", "T2 unknown"}
+
+
+def test_outreach_targets_growth_target_AND_negative_status():
+    venues = [
+        _venue("Growth+No", growth_target=True, recommended_status="No, with hard evidence"),
+        _venue("Growth+Unlikely", growth_target=True, recommended_status="Unlikely"),
+        _venue("Growth+Unknown", growth_target=True, recommended_status="Unknown"),  # excluded
+        _venue("NoGrowth+No", growth_target=False, recommended_status="No, with hard evidence"),  # excluded
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([])
+    targets = find_outreach_targets(venues, lookup, df, event_year=2026)
+    names = {t["name"] for t in targets}
+    assert names == {"Growth+No", "Growth+Unlikely"}
+
+
+# -- calculate_growth_target_activity --------------------------------------
+
+def test_growth_target_activity_counts_inquiries_and_bookings():
+    venues = [
+        _venue("Casa Real", tier="Tier 2", growth_target=True),
+        _venue("Plain Venue", tier="Tier 3", growth_target=False),
+    ]
+    lookup = build_venue_tier_lookup(venues)
+    df = pd.DataFrame([
+        _inquiry_row("12/15/26", "Casa Real", "Booked"),
+        _inquiry_row("12/16/26", "Casa Real", "Didn't Book"),
+        _inquiry_row("12/17/26", "Casa Real", "Cold"),
+        _inquiry_row("12/18/26", "Plain Venue", "Booked"),  # not a growth target
+    ])
+    out = calculate_growth_target_activity(venues, lookup, df, event_year=2026)
+    assert len(out) == 1
+    assert out[0]["name"] == "Casa Real"
+    assert out[0]["inquiries"] == 3
+    assert out[0]["booked"] == 1
 
 
 # -- bucket order constant -------------------------------------------------

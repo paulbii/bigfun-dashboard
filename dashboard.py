@@ -3,15 +3,17 @@ Big Fun DJ Operations Dashboard
 A read-only status board showing booking pace, lead metrics, and capacity.
 """
 
-import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
-import pandas as pd
-from datetime import datetime, timedelta
-import requests
-from functools import lru_cache
+import re
 import time
+from datetime import datetime, timedelta
+from functools import lru_cache
+
+import gspread
+import pandas as pd
 import plotly.graph_objects as go
+import requests
+import streamlit as st
+from google.oauth2.service_account import Credentials
 
 # =============================================================================
 # CONFIGURATION
@@ -46,6 +48,16 @@ LEAD_TIME_BUCKETS = ["<3 mo", "3-6 mo", "6-12 mo", "12+ mo"]
 # numbers reflect actual sales performance, not how full the calendar is.
 CAPACITY_RESOLUTIONS = {"Full", "We turn down"}
 
+# Airtable Venues table (BIG FUN Disc Jockeys base). Field IDs are stable
+# across renames; field names aren't.
+AIRTABLE_BASE_ID = "appPMPQxGhQa6pWDz"
+AIRTABLE_VENUES_TABLE_ID = "tblHtQx3eq0EFrRAq"
+AIRTABLE_FIELD_NAME = "fldUtX1ExbnUCHBIu"
+AIRTABLE_FIELD_FORMER_NAMES = "fldGsvjPqCRrhEdm1"
+AIRTABLE_FIELD_TIER = "fldeseALwwueuZmcF"
+AIRTABLE_FIELD_GROWTH_TARGET = "fld0ocfdRuSXnxp3M"
+AIRTABLE_FIELD_RECOMMENDED_STATUS = "fld0JQJ2kvyySfKuD"
+
 # =============================================================================
 # AUTHENTICATION
 # =============================================================================
@@ -68,6 +80,58 @@ def get_google_client():
 # =============================================================================
 # DATA FETCHING
 # =============================================================================
+
+def get_airtable_pat():
+    """Read the Airtable PAT from Streamlit Cloud secrets, falling back to
+    ~/.airtable-pat for local dev. Mirrors the gcp_service_account pattern."""
+    try:
+        return str(st.secrets["airtable_pat"]).strip()
+    except (KeyError, FileNotFoundError):
+        from pathlib import Path
+        local = Path.home() / ".airtable-pat"
+        if local.exists():
+            return local.read_text().strip()
+        return ""
+
+
+@st.cache_data(ttl=3600)
+def get_venue_tiers_from_airtable():
+    """Fetch the Venues table and return a list of {name, former_names, tier,
+    growth_target, recommended_status} dicts. Returns [] if PAT isn't set."""
+    pat = get_airtable_pat()
+    if not pat:
+        return []
+
+    headers = {"Authorization": f"Bearer {pat}"}
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_VENUES_TABLE_ID}"
+    params = {"pageSize": 100, "returnFieldsByFieldId": "true"}
+    out = []
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        for rec in data.get("records", []):
+            f = rec.get("fields", {})
+            name = f.get(AIRTABLE_FIELD_NAME, "")
+            if not name:
+                continue
+            tier_raw = f.get(AIRTABLE_FIELD_TIER)
+            tier_str = tier_raw.get("name") if isinstance(tier_raw, dict) else (tier_raw or "")
+            rec_status = f.get(AIRTABLE_FIELD_RECOMMENDED_STATUS)
+            rec_status_str = rec_status.get("name") if isinstance(rec_status, dict) else (rec_status or "")
+            out.append({
+                "name": name,
+                "former_names": f.get(AIRTABLE_FIELD_FORMER_NAMES, "") or "",
+                "tier": tier_str,
+                "growth_target": bool(f.get(AIRTABLE_FIELD_GROWTH_TARGET, False)),
+                "recommended_status": rec_status_str,
+            })
+        offset = data.get("offset")
+        if not offset:
+            break
+        params["offset"] = offset
+    return out
+
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def get_year_comparison_data():
@@ -1178,6 +1242,234 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     }
 
 
+def normalize_venue_name(name):
+    """Normalize a venue name for lookup: strip trailing parens, lowercase,
+    remove punctuation, collapse whitespace. Matches the Inquiry Tracker's
+    free-text 'Venue (if known)' to Airtable's canonical names + Former Names."""
+    if not name:
+        return ""
+    s = str(name).strip()
+    while True:
+        new_s = re.sub(r"\s*\([^()]*\)\s*$", "", s).strip()
+        if new_s == s or not new_s:
+            break
+        s = new_s
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def build_venue_tier_lookup(venues):
+    """Build a normalized-name → venue-info dict from Airtable rows.
+
+    Indexes both the canonical Name and every Former Name. Earlier-listed
+    entries win on collision, so the canonical name is registered first.
+    """
+    lookup = {}
+    for v in venues or []:
+        info = {
+            "canonical_name": v["name"],
+            "tier": v.get("tier", ""),
+            "growth_target": bool(v.get("growth_target", False)),
+            "recommended_status": v.get("recommended_status", "") or "Unknown",
+        }
+        key = normalize_venue_name(v["name"])
+        if key and key not in lookup:
+            lookup[key] = info
+        former = v.get("former_names", "") or ""
+        for line in former.splitlines():
+            fkey = normalize_venue_name(line)
+            if fkey and fkey not in lookup:
+                lookup[fkey] = info
+    return lookup
+
+
+def venue_to_tier_info(name, lookup, default_tier="Tier 4"):
+    """Look up tier metadata for an inquiry's venue name. Returns None for
+    blank inputs (so callers can exclude them from analysis); returns a default
+    Tier 4 record for non-blank but unmatched names."""
+    if not name or not str(name).strip():
+        return None
+    info = lookup.get(normalize_venue_name(name))
+    if info:
+        return info
+    return {
+        "canonical_name": str(name).strip(),
+        "tier": default_tier,
+        "growth_target": False,
+        "recommended_status": "Unknown",
+    }
+
+
+def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
+    """Conversion + decision velocity per tier. Tier 3 and Tier 4 are rolled
+    into 'Tier 3+' to keep sample sizes meaningful."""
+    rows = []
+    for _, row in df.iterrows():
+        if not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        inquiry_dt = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
+        decision_dt = pd.to_datetime(row.get("Decision Date"), errors="coerce")
+        if pd.isna(inquiry_dt) or pd.isna(decision_dt):
+            continue
+        info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
+        if info is None:
+            continue
+        event_dt = _parse_event_date(row.get("Event Date", ""))
+        rows.append({
+            "tier": info["tier"],
+            "resolution": str(row.get("Resolution", "")).strip(),
+            "decision_days": (decision_dt - inquiry_dt).days,
+            "lead_days": (event_dt - inquiry_dt).days if pd.notna(event_dt) else None,
+        })
+
+    if not rows:
+        return {}
+
+    tdf = pd.DataFrame(rows)
+    out = {}
+    # Roll Tier 3 + Tier 4 together; cells get thin otherwise.
+    tdf["tier_group"] = tdf["tier"].replace({"Tier 3": "Tier 3+", "Tier 4": "Tier 3+"})
+    for group_name in ["Tier 1", "Tier 2", "Tier 3+"]:
+        sub = tdf[tdf["tier_group"] == group_name]
+        if sub.empty:
+            continue
+        eligible = sub[~sub["resolution"].isin(CAPACITY_RESOLUTIONS)]
+        booked = int((sub["resolution"] == "Booked").sum())
+        denom = len(eligible)
+        decisions = sub["decision_days"].dropna()
+        leads = sub["lead_days"].dropna()
+        out[group_name] = {
+            "count": len(sub),
+            "eligible": denom,
+            "booked": booked,
+            "conversion_rate": (booked / denom * 100) if denom > 0 else 0.0,
+            "median_days_to_decision": float(decisions.median()) if len(decisions) > 0 else 0.0,
+            "median_lead_days": float(leads.median()) if len(leads) > 0 else 0.0,
+        }
+    return out
+
+
+def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=2026):
+    """Conversion sliced by Airtable's Recommended Status (5-value enum)."""
+    rows = []
+    for _, row in df.iterrows():
+        if not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
+        if info is None:
+            continue
+        rows.append({
+            "status": info["recommended_status"] or "Unknown",
+            "resolution": str(row.get("Resolution", "")).strip(),
+        })
+
+    if not rows:
+        return {}
+
+    sdf = pd.DataFrame(rows)
+    out = {}
+    for status, sub in sdf.groupby("status"):
+        eligible = sub[~sub["resolution"].isin(CAPACITY_RESOLUTIONS)]
+        booked = int((sub["resolution"] == "Booked").sum())
+        denom = len(eligible)
+        out[status] = {
+            "count": len(sub),
+            "eligible": denom,
+            "booked": booked,
+            "conversion_rate": (booked / denom * 100) if denom > 0 else 0.0,
+        }
+    return out
+
+
+def find_research_targets(venues, tier_lookup, df, event_year=2026):
+    """Tier 1/2 venues whose Recommended Status is Unknown — meaning we don't
+    know whether we're on their preferred list. For each, count 2026 inquiries
+    so the operator can prioritize venues sending us business."""
+    inquiry_counts = {}
+    for _, row in df.iterrows():
+        if not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
+        if info is None:
+            continue
+        inquiry_counts[info["canonical_name"]] = inquiry_counts.get(info["canonical_name"], 0) + 1
+
+    targets = []
+    for v in venues or []:
+        if v.get("tier") not in ("Tier 1", "Tier 2"):
+            continue
+        status = (v.get("recommended_status") or "Unknown")
+        if status != "Unknown":
+            continue
+        targets.append({
+            "name": v["name"],
+            "tier": v["tier"],
+            "inquiries_this_year": inquiry_counts.get(v["name"], 0),
+        })
+    targets.sort(key=lambda r: (-r["inquiries_this_year"], r["tier"], r["name"]))
+    return targets
+
+
+def find_outreach_targets(venues, tier_lookup, df, event_year=2026):
+    """Growth-target venues we know we're not on the preferred list for —
+    confirmed outreach candidates."""
+    inquiry_counts = {}
+    for _, row in df.iterrows():
+        if not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
+        if info is None:
+            continue
+        inquiry_counts[info["canonical_name"]] = inquiry_counts.get(info["canonical_name"], 0) + 1
+
+    NEGATIVE_STATUSES = {"Unlikely", "No, with hard evidence"}
+    targets = []
+    for v in venues or []:
+        if not v.get("growth_target"):
+            continue
+        if v.get("recommended_status") not in NEGATIVE_STATUSES:
+            continue
+        targets.append({
+            "name": v["name"],
+            "tier": v.get("tier", ""),
+            "recommended_status": v["recommended_status"],
+            "inquiries_this_year": inquiry_counts.get(v["name"], 0),
+        })
+    targets.sort(key=lambda r: (-r["inquiries_this_year"], r["tier"], r["name"]))
+    return targets
+
+
+def calculate_growth_target_activity(venues, tier_lookup, df, event_year=2026):
+    """For each Growth Target venue, count 2026 inquiries and how many booked.
+    Lets Paul see whether his investment in those venues is showing up."""
+    counts = {}
+    for _, row in df.iterrows():
+        if not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        info = venue_to_tier_info(row.get("Venue (if known)", ""), tier_lookup)
+        if info is None:
+            continue
+        d = counts.setdefault(info["canonical_name"], {"inquiries": 0, "booked": 0})
+        d["inquiries"] += 1
+        if str(row.get("Resolution", "")).strip() == "Booked":
+            d["booked"] += 1
+
+    out = []
+    for v in venues or []:
+        if not v.get("growth_target"):
+            continue
+        c = counts.get(v["name"], {"inquiries": 0, "booked": 0})
+        out.append({
+            "name": v["name"],
+            "tier": v.get("tier", ""),
+            "recommended_status": v.get("recommended_status", "") or "Unknown",
+            "inquiries": c["inquiries"],
+            "booked": c["booked"],
+        })
+    out.sort(key=lambda r: (-r["inquiries"], -r["booked"], r["tier"], r["name"]))
+    return out
+
+
 # Capacity-status values from the Inquiry Tracker form. Encoded here so the
 # transform doesn't need to query the form's allowed-value list at runtime.
 FULL_REASON_TRUE_CAPACITY = "True Capacity"
@@ -2030,6 +2322,184 @@ def main():
             st.plotly_chart(cap_chart, use_container_width=True)
     else:
         st.info("No 2026 Full events to analyze yet")
+
+    # ==========================================================================
+    # ROWS 12-14: Venue tier slicing (reads Airtable Venues table)
+    # ==========================================================================
+
+    venues = []
+    tier_lookup = {}
+    try:
+        venues = get_venue_tiers_from_airtable()
+        tier_lookup = build_venue_tier_lookup(venues)
+    except Exception as e:
+        st.caption(f"Could not load venue tiers from Airtable: {str(e)[:120]}")
+
+    if venues and inquiry_df is not None and not inquiry_df.empty:
+        # ROW 12: Conversion by Venue Tier
+        st.divider()
+        st.subheader("🏛️ Conversion by Venue Tier (2026)")
+        st.caption(
+            "Slices conversion and decision velocity by venue tier "
+            "(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
+            "for sample-size discipline."
+        )
+        try:
+            tier_metrics = calculate_metrics_by_tier(inquiry_df, tier_lookup)
+        except Exception as e:
+            tier_metrics = {}
+            st.caption(f"Tier calc failed: {str(e)[:100]}")
+        if tier_metrics:
+            tier_rows = []
+            for group in ["Tier 1", "Tier 2", "Tier 3+"]:
+                if group not in tier_metrics:
+                    continue
+                m = tier_metrics[group]
+                tier_rows.append({
+                    "Tier": group,
+                    "Conversion": f"{m['conversion_rate']:.0f}%",
+                    "Median days to decision": f"{m['median_days_to_decision']:.0f}",
+                    "Median lead time (days)": f"{m['median_lead_days']:.0f}",
+                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                    "Total inquiries": m["count"],
+                })
+            st.dataframe(pd.DataFrame(tier_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("No tier-classifiable inquiries for 2026 yet")
+
+        # ROW 13: Conversion by Recommended Status
+        st.divider()
+        st.subheader("🤝 Conversion by Recommended Status (2026)")
+        st.caption(
+            "How conversion varies based on whether BIG FUN is on the venue's "
+            "preferred-vendor list. Hypothesis: 'Yes, with hard evidence' should "
+            "outperform 'No, with hard evidence'. Empty rows mean no inquiries "
+            "from venues in that status."
+        )
+        try:
+            status_metrics = calculate_metrics_by_recommended_status(inquiry_df, tier_lookup)
+        except Exception as e:
+            status_metrics = {}
+            st.caption(f"Status calc failed: {str(e)[:100]}")
+        if status_metrics:
+            STATUS_ORDER = [
+                "Yes, with hard evidence",
+                "Yes/Likely, with no hard evidence",
+                "Unknown",
+                "Unlikely",
+                "No, with hard evidence",
+            ]
+            status_rows = []
+            seen = set()
+            for s in STATUS_ORDER:
+                if s in status_metrics:
+                    m = status_metrics[s]
+                    status_rows.append({
+                        "Recommended Status": s,
+                        "Conversion": f"{m['conversion_rate']:.0f}%",
+                        "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                        "Total inquiries": m["count"],
+                    })
+                    seen.add(s)
+            # Surface anything we didn't expect (defensive)
+            for s, m in status_metrics.items():
+                if s in seen:
+                    continue
+                status_rows.append({
+                    "Recommended Status": s or "(blank)",
+                    "Conversion": f"{m['conversion_rate']:.0f}%",
+                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                    "Total inquiries": m["count"],
+                })
+            st.dataframe(pd.DataFrame(status_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("No status-classifiable inquiries for 2026 yet")
+
+        # ROW 14: Action lists — Research / Outreach / Growth Targets
+        st.divider()
+        st.subheader("🎯 Action lists")
+        action_col1, action_col2 = st.columns(2)
+
+        with action_col1:
+            st.markdown("**🔍 Research Targets**")
+            st.caption(
+                "Tier 1/2 venues where we don't know whether we're on their preferred list. "
+                "Sorted by 2026 inquiry volume — chase the ones sending us business first."
+            )
+            try:
+                research = find_research_targets(venues, tier_lookup, inquiry_df)
+            except Exception as e:
+                research = []
+                st.caption(f"Research-targets calc failed: {str(e)[:100]}")
+            if research:
+                research_rows = [
+                    {
+                        "Venue": t["name"][:40],
+                        "Tier": t["tier"],
+                        "Inquiries (2026)": t["inquiries_this_year"],
+                    }
+                    for t in research
+                ]
+                st.dataframe(pd.DataFrame(research_rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("All Tier 1/2 venues have a known preferred-list status")
+
+        with action_col2:
+            st.markdown("**📤 Outreach Targets**")
+            st.caption(
+                "Growth-target venues we've confirmed we're not on the preferred list for. "
+                "Highest-priority outreach — declared intent + known gap."
+            )
+            try:
+                outreach = find_outreach_targets(venues, tier_lookup, inquiry_df)
+            except Exception as e:
+                outreach = []
+                st.caption(f"Outreach-targets calc failed: {str(e)[:100]}")
+            if outreach:
+                outreach_rows = [
+                    {
+                        "Venue": t["name"][:35],
+                        "Tier": t["tier"],
+                        "Status": t["recommended_status"],
+                        "Inquiries (2026)": t["inquiries_this_year"],
+                    }
+                    for t in outreach
+                ]
+                st.dataframe(pd.DataFrame(outreach_rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("No outreach targets — fill in Recommended Status for growth-target venues")
+
+        # Growth Target activity (full width)
+        st.markdown("**🌱 Growth Target Activity**")
+        st.caption(
+            "Recent inquiry and booking counts for every venue you've flagged as a growth target. "
+            "If a flagged venue isn't generating inquiries over time, the bet isn't paying off."
+        )
+        try:
+            gt_activity = calculate_growth_target_activity(venues, tier_lookup, inquiry_df)
+        except Exception as e:
+            gt_activity = []
+            st.caption(f"Growth-target calc failed: {str(e)[:100]}")
+        if gt_activity:
+            gt_rows = [
+                {
+                    "Venue": v["name"][:45],
+                    "Tier": v["tier"],
+                    "Status": v["recommended_status"],
+                    "2026 Inquiries": v["inquiries"],
+                    "2026 Booked": v["booked"],
+                }
+                for v in gt_activity
+            ]
+            st.dataframe(pd.DataFrame(gt_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("No growth-target venues flagged. Check the Airtable Venues table.")
+    elif inquiry_df is not None:
+        st.divider()
+        st.caption(
+            "Venue tier sections require an Airtable Personal Access Token. "
+            "Add it to Streamlit secrets as `airtable_pat`, or save to ~/.airtable-pat for local dev."
+        )
 
     # ==========================================================================
     # Footer
