@@ -469,6 +469,13 @@ def get_upcoming_events(days_ahead=14):
     return unique_events
 
 
+def is_setup_event(event):
+    """True when a gig-db feed record is a setup/rehearsal day (Event Type =
+    Setup). Setups are real commitments (van + gear out) but not bookings, so
+    they're labeled, not counted, in the Upcoming Events list."""
+    return str(event.get("event_type", "")).strip().lower() == "setup"
+
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================
@@ -2177,8 +2184,11 @@ def main():
                         # Truncate venue name
                         if len(venue) > 20:
                             venue = venue[:17] + "..."
-                        
-                        st.text(f"[{initials}] {venue}")
+
+                        label = f"[{initials}] {venue}"
+                        if is_setup_event(event):
+                            label += " (Setup)"
+                        st.text(label)
                     st.text("")  # Spacer
         else:
             st.info("No upcoming events found")
