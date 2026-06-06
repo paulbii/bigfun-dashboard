@@ -1,0 +1,11 @@
+# Extend the default gitleaks ruleset with project-specific allowlists.
+[extend]
+useDefault = true
+
+# Airtable base/table/field/record IDs use the same character class as PATs and
+# falsely trip the airtable-api-key rule. They are non-secret identifiers that
+# appear in every Airtable API URL, so allowlist them globally.
+[[allowlists]]
+description = "Airtable object IDs (app/tbl/fld/rec/usr/wrk/tag prefixes) are public identifiers, not secrets"
+regexes = ['''\b(app|tbl|fld|rec|usr|wrk|tag)[a-zA-Z0-9]{14}\b''']
+regexTarget = "match"

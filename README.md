@@ -107,4 +107,43 @@ Data is cached for 5 minutes to reduce API calls. Click the 🔄 button to force
 
 ---
 
+## IG Tag Puller (sibling tool)
+
+Standalone script that pulls Instagram posts where @bigfundj is tagged and upserts them into the Airtable `IG Tags` table, matching each tagging account against the Vendors table. Lives in `ig_tag_puller.py`. Runs daily via GitHub Actions (`.github/workflows/ig-tags-daily.yml`).
+
+**Why it lives here:** reuses the Airtable patterns already in `dashboard.py`. Not part of the Streamlit app, runs as a scheduled job.
+
+### One-time Meta setup
+
+Follow [META_SETUP.md](META_SETUP.md). Produces four credentials:
+- `META_APP_ID`
+- `META_APP_SECRET`
+- `IG_BUSINESS_ACCOUNT_ID`
+- `IG_PAGE_ACCESS_TOKEN`
+
+### Local testing
+
+Save the four Meta credentials to `~/.meta-tokens.env` (one `KEY=value` per line), and your Airtable PAT to `~/.airtable-pat`. Then:
+
+```bash
+python ig_tag_puller.py
+```
+
+The script prints how many tags it pulled, how many were created vs refreshed, and lists handles that didn't match a vendor (your queue to review).
+
+### GitHub Actions setup
+
+After local testing works, wire up GitHub Secrets:
+
+1. Repo on GitHub → Settings → Secrets and variables → Actions
+2. Add five repository secrets, names matching the env vars above plus `AIRTABLE_PAT`
+3. The workflow at `.github/workflows/ig-tags-daily.yml` runs daily at 14:00 UTC (~7am PT)
+4. Manually trigger from the Actions tab the first time to verify it works end-to-end
+
+### Token expiration
+
+Long-lived Page Access Tokens last ~60 days. When the script starts failing with auth errors, repeat steps 4-5 of `META_SETUP.md` to get a fresh token, then update the `IG_PAGE_ACCESS_TOKEN` GitHub Secret. No code changes needed.
+
+---
+
 *Part of the Big Fun DJ automation suite*
