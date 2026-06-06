@@ -87,15 +87,19 @@ def get_google_client():
 # =============================================================================
 
 def get_airtable_pat():
-    """Read the Airtable PAT from Streamlit Cloud secrets, falling back to
-    ~/.airtable-pat for local dev. Mirrors the gcp_service_account pattern."""
+    """Read the Airtable PAT. On Streamlit Cloud uses st.secrets; on local Mac
+    falls back to macOS Keychain (service `bigfun-airtable-pat`, account `paul`).
+    Add locally with: security add-generic-password -s bigfun-airtable-pat -a paul -w <PAT> -U"""
     try:
         return str(st.secrets["airtable_pat"]).strip()
     except (KeyError, FileNotFoundError):
-        from pathlib import Path
-        local = Path.home() / ".airtable-pat"
-        if local.exists():
-            return local.read_text().strip()
+        try:
+            import keyring
+            pat = keyring.get_password("bigfun-airtable-pat", "paul")
+            if pat:
+                return pat.strip()
+        except Exception:
+            pass
         return ""
 
 
@@ -2694,7 +2698,8 @@ def main():
         st.divider()
         st.caption(
             "Venue tier sections require an Airtable Personal Access Token. "
-            "Add it to Streamlit secrets as `airtable_pat`, or save to ~/.airtable-pat for local dev."
+            "Add it to Streamlit secrets as `airtable_pat`, or to macOS Keychain via "
+            "`security add-generic-password -s bigfun-airtable-pat -a paul -w <PAT> -U` for local dev."
         )
 
     # ==========================================================================
