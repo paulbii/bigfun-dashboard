@@ -480,6 +480,31 @@ def is_setup_event(event):
     return str(event.get("event_type", "")).strip().lower() == "setup"
 
 
+@st.cache_data(ttl=3600)
+def get_event_count(year):
+    """True event count from the gig database for a year.
+
+    One gig-db record = one event, so a co-DJ event counts ONCE here (unlike the
+    per-DJ matrix tallies, where it's credited to each DJ). Setups are excluded
+    (a setup isn't a booked event). Returns (events, setups), or (None, 0) if
+    the feed can't be read.
+    """
+    filemaker_url = get_filemaker_url()
+    if not filemaker_url:
+        return None, 0
+    try:
+        resp = requests.get(f"{filemaker_url}/listviewjson.php?year={year}", timeout=10)
+        if resp.status_code != 200:
+            return None, 0
+        records = resp.json()
+        if not isinstance(records, list):
+            return None, 0
+    except Exception:
+        return None, 0
+    setups = sum(1 for r in records if is_setup_event(r))
+    return len(records) - setups, setups
+
+
 # =============================================================================
 # DATA PROCESSING
 # =============================================================================
@@ -2213,20 +2238,32 @@ def main():
         if dj_counts:
             # Separate TBA from assigned DJs
             tba_count = dj_counts.pop("TBA", 0)
-            
+            assigned_total = sum(dj_counts.values())
+
+            # True event count from the gig db (one record = one event, so a
+            # co-DJ event counts once), excluding setups. Distinct from the
+            # per-DJ tallies below, which are assignments and sum higher whenever
+            # an event has more than one DJ.
+            events, setups = get_event_count(2026)
+            if events is not None:
+                ev_label = f"Events (2026){f' — {setups} setup(s) excluded' if setups else ''}"
+                st.metric(ev_label, events)
+
             # Sort assigned DJs by count descending
             sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
-            
-            # Create columns for each DJ
             cols = st.columns(len(sorted_djs))
-            
             for idx, (dj_name, count) in enumerate(sorted_djs):
                 with cols[idx]:
                     st.metric(label=dj_name, value=count)
-            
-            # Show totals
-            assigned_total = sum(dj_counts.values())
-            st.caption(f"Assigned: {assigned_total} • Unassigned (TBA): {tba_count} • Total: {assigned_total + tba_count}")
+
+            if events is not None:
+                st.caption(
+                    f"Per-DJ numbers are assignments (a co-DJ event is credited to both DJs), "
+                    f"so they total {assigned_total} — more than the {events} events. "
+                    f"Unassigned (TBA): {tba_count}."
+                )
+            else:
+                st.caption(f"DJ assignments: {assigned_total} • Unassigned (TBA): {tba_count}")
         else:
             st.info("No booking data available")
     except Exception as e:
