@@ -4,9 +4,7 @@ A read-only status board showing booking pace, lead metrics, and capacity.
 """
 
 import re
-import time
 from datetime import datetime, timedelta
-from functools import lru_cache
 
 import gspread
 import pandas as pd
@@ -18,6 +16,10 @@ from google.oauth2.service_account import Credentials
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+# The event year the dashboard reports on. Bump once each January — every
+# year-scoped metric, label, and filter reads this.
+EVENT_YEAR = 2026
 
 BOOKING_SNAPSHOTS_SHEET_ID = "1JV5S1hbtYcXhVoeqsYVw_nhUvRoOlSBt5BYZ0ffxFkU"
 INQUIRY_TRACKER_SHEET_ID = "1ng-OytB9LJ8Fmfazju4cfFJRRa6bqfRIZA8GYEWhJRs"
@@ -41,15 +43,15 @@ SCOPES = [
 # median rate from a sample of 63 events booked at the new rates. The mean of
 # the same sample is $2,231 — lower because some events get policy-driven
 # discounts (school events, shorter packages) that shouldn't dilute the
-# typical-wedding baseline. Used as the deal-size constant in the
-# pipeline-velocity formula and for "potential declined revenue" framing.
+# typical-wedding baseline. Used for the "potential declined revenue" framing
+# in Capacity Reality.
 AVG_DEAL_SIZE = 2299
 
 LEAD_TIME_BUCKETS = ["<3 mo", "3-6 mo", "6-12 mo", "12+ mo"]
 
 # Resolutions that aren't sales failures (capacity/policy outcomes). Excluded
-# from conversion-rate denominators and pipeline-velocity calculations so the
-# numbers reflect actual sales performance, not how full the calendar is.
+# from conversion-rate denominators so the numbers reflect actual sales
+# performance, not how full the calendar is.
 CAPACITY_RESOLUTIONS = {"Full", "We turn down"}
 
 # Airtable Venues table (BIG FUN Disc Jockeys base). Field IDs are stable
@@ -163,6 +165,67 @@ def get_year_comparison_data():
     return df
 
 
+def dedupe_inquiries(df):
+    """Deduplicate inquiry rows by (Event Date, Venue), newest-first:
+    - Multiple Booked entries = separate clients, keep all
+    - Canceled with a timestamp after the earliest Booked = one cancellation,
+      reduces the kept Booked rows by one (netting to zero keeps the newest
+      Canceled row instead)
+    - Non-Booked only = keep the newest row
+    Venue is case-normalized so casing differences still pair up. Known limit:
+    rows with a BLANK venue share one key per date, so two different no-venue
+    inquiries for the same date collapse to one row.
+    Returns df unchanged if the key columns are missing."""
+    if not ("Timestamp" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns):
+        return df
+
+    df = df.copy()
+    df["_parsed_timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df = df.sort_values("_parsed_timestamp", ascending=False)
+
+    def smart_dedup(group):
+        if len(group) == 1:
+            return group
+
+        if "Resolution" not in group.columns:
+            return group.head(1)
+
+        resolutions = group["Resolution"].str.lower().str.strip()
+        booked_rows = group[resolutions == "booked"].sort_values("_parsed_timestamp", ascending=False)
+        canceled_rows = group[resolutions == "canceled"]
+
+        if len(booked_rows) == 0:
+            # No bookings - keep newest row only
+            return group.head(1)
+
+        # Count valid cancellations (timestamp after the earliest booking)
+        earliest_booking_ts = booked_rows["_parsed_timestamp"].min()
+        valid_cancellations = 0
+        for _, cancel_row in canceled_rows.iterrows():
+            cancel_ts = cancel_row["_parsed_timestamp"]
+            if pd.notna(cancel_ts) and pd.notna(earliest_booking_ts) and cancel_ts > earliest_booking_ts:
+                valid_cancellations += 1
+
+        net_bookings = max(0, len(booked_rows) - valid_cancellations)
+
+        if net_bookings == 0:
+            # All bookings canceled - return newest canceled row
+            return canceled_rows.head(1) if len(canceled_rows) > 0 else group.head(1)
+
+        # Return the newest N booked rows
+        return booked_rows.head(net_bookings)
+
+    # Group on a derived key so Event Date / Venue stay as real columns
+    # (pandas 2.3+ drops grouping columns from apply() results by default).
+    df["_dedup_key"] = (
+        df["Event Date"].astype(str).str.strip()
+        + "|"
+        + df["Venue (if known)"].astype(str).str.strip().str.lower()
+    )
+    df = df.groupby("_dedup_key", group_keys=False).apply(smart_dedup)
+    return df.drop(columns=["_parsed_timestamp", "_dedup_key"], errors="ignore")
+
+
 @st.cache_data(ttl=3600)
 def get_inquiry_tracker_data():
     """Fetch all inquiry data from the Inquiry Tracker sheet."""
@@ -201,29 +264,17 @@ def get_inquiry_tracker_data():
     # Track pre-dedup count
     pre_dedup_count = len(df)
 
-    # Count pre-dedup 2026 cancellations so the UI can show
+    # Count pre-dedup cancellations (EVENT_YEAR events) so the UI can show
     # "peak bookings" (current Booked + cancelled after booking).
     # Done before smart_dedup strips cancellations that paired with Bookeds.
     # Also split into pre-booking vs post-booking based on whether any Booked
     # row exists for the same (event date, venue) key.
-    canceled_2026 = 0
-    canceled_post_booking_2026 = 0
-    canceled_pre_booking_2026 = 0
+    canceled_year = 0
+    canceled_post_booking = 0
+    canceled_pre_booking = 0
     if "Resolution" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
-        def _is_2026(ed):
-            s = str(ed).strip()
-            if not s:
-                return False
-            for fmt in ["%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"]:
-                try:
-                    return pd.to_datetime(s, format=fmt).year == 2026
-                except Exception:
-                    continue
-            dt = pd.to_datetime(s, errors="coerce")
-            return pd.notna(dt) and dt.year == 2026
-
-        is_2026_event = df["Event Date"].apply(_is_2026)
-        canceled_2026 = int(((df["Resolution"] == "Canceled") & is_2026_event).sum())
+        is_year_event = df["Event Date"].apply(lambda v: _is_year(v, EVENT_YEAR))
+        canceled_year = int(((df["Resolution"] == "Canceled") & is_year_event).sum())
 
         # Match the same key shape as smart_dedup so post-booking detection
         # agrees with how the deduplicator pairs cancellations with bookings.
@@ -232,96 +283,32 @@ def get_inquiry_tracker_data():
             + "|"
             + df["Venue (if known)"].astype(str).str.strip().str.lower()
         )
-        booked_keys_2026 = set(cancel_key[(df["Resolution"] == "Booked") & is_2026_event])
-        canceled_post_booking_2026 = int(
+        booked_keys = set(cancel_key[(df["Resolution"] == "Booked") & is_year_event])
+        canceled_post_booking = int(
             (
                 (df["Resolution"] == "Canceled")
-                & is_2026_event
-                & cancel_key.isin(booked_keys_2026)
+                & is_year_event
+                & cancel_key.isin(booked_keys)
             ).sum()
         )
-        canceled_pre_booking_2026 = canceled_2026 - canceled_post_booking_2026
+        canceled_pre_booking = canceled_year - canceled_post_booking
     
-    # Deduplicate by (Event Date, Venue), with special handling for multiple bookings
-    # - Multiple Booked entries = separate clients, keep all
-    # - Canceled after any Booked = one cancellation, reduce count by 1
-    # - Non-Booked only = keep newest
-    if "Timestamp" in df.columns and "Event Date" in df.columns and "Venue (if known)" in df.columns:
-        # Parse timestamp for sorting
-        df["_parsed_timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-        
-        # Sort by timestamp descending (newest first)
-        df = df.sort_values("_parsed_timestamp", ascending=False)
-        
-        # Smart deduplication
-        def smart_dedup(group):
-            if len(group) == 1:
-                return group
-            
-            resolution_col = "Resolution" if "Resolution" in group.columns else None
-            if not resolution_col:
-                return group.head(1)
-            
-            # Find Booked and Canceled rows
-            booked_mask = group[resolution_col].str.lower().str.strip() == "booked"
-            canceled_mask = group[resolution_col].str.lower().str.strip() == "canceled"
-            
-            booked_rows = group[booked_mask].sort_values("_parsed_timestamp", ascending=False)
-            canceled_rows = group[canceled_mask]
-            
-            if len(booked_rows) == 0:
-                # No bookings - keep newest row only
-                return group.head(1)
-            
-            # Count valid cancellations (timestamp after ANY booking)
-            earliest_booking_ts = booked_rows["_parsed_timestamp"].min()
-            valid_cancellations = 0
-            for _, cancel_row in canceled_rows.iterrows():
-                cancel_ts = cancel_row["_parsed_timestamp"]
-                if pd.notna(cancel_ts) and pd.notna(earliest_booking_ts) and cancel_ts > earliest_booking_ts:
-                    valid_cancellations += 1
-            
-            # Net bookings = booked - cancellations (minimum 0)
-            net_bookings = max(0, len(booked_rows) - valid_cancellations)
-            
-            if net_bookings == 0:
-                # All bookings canceled - return newest canceled row
-                return canceled_rows.head(1) if len(canceled_rows) > 0 else group.head(1)
-            
-            # Return the newest N booked rows
-            return booked_rows.head(net_bookings)
-        
-        # Group on a derived key so Event Date / Venue stay as real columns.
-        # pandas 2.3+ drops grouping columns from apply() results by default,
-        # which was silently removing these columns from the DataFrame.
-        # Case-normalize the venue so "el Prado" and "el PRADO" group together
-        # (so a Canceled row cancels its Booked counterpart even if the venue
-        # casing differs between submissions).
-        df["_dedup_key"] = (
-            df["Event Date"].astype(str).str.strip()
-            + "|"
-            + df["Venue (if known)"].astype(str).str.strip().str.lower()
-        )
-        df = df.groupby("_dedup_key", group_keys=False).apply(smart_dedup)
+    df = dedupe_inquiries(df)
 
-        # Clean up temp columns (pandas 2.3+ may have already dropped _dedup_key
-        # as the grouping column, so ignore missing).
-        df = df.drop(columns=["_parsed_timestamp", "_dedup_key"], errors="ignore")
-    
     # Store dedup stats in a special row (will be filtered out later)
     # Actually, let's add columns instead
     df["_dedup_pre"] = pre_dedup_count
     df["_dedup_post"] = len(df)
-    df["_canceled_2026_predup"] = canceled_2026
-    df["_canceled_post_booking_2026"] = canceled_post_booking_2026
-    df["_canceled_pre_booking_2026"] = canceled_pre_booking_2026
+    df["_canceled_predup"] = canceled_year
+    df["_canceled_post_booking"] = canceled_post_booking
+    df["_canceled_pre_booking"] = canceled_pre_booking
 
     return df
 
 
 @st.cache_data(ttl=3600)
-def get_dj_booking_counts(year=2026):
-    """Count BOOKED events per DJ from the Availability Matrix."""
+def get_dj_booking_counts(year=EVENT_YEAR):
+    """Count BOOKED events per DJ from the Availability Matrix (year tab)."""
     client = get_google_client()
     sheet = client.open_by_key(AVAILABILITY_MATRIX_SHEET_ID)
     
@@ -379,7 +366,11 @@ def get_dj_booking_counts(year=2026):
         for row in all_values[1:]:  # Skip header
             if col_idx < len(row):
                 cell_value = str(row[col_idx]).strip().upper()
-                if (
+                # "BOOKED x 2" = two events that day (same rule as the TBA column)
+                multi = re.match(r"BOOKED\s*X\s*(\d+)", cell_value)
+                if multi:
+                    count += int(multi.group(1))
+                elif (
                     cell_value == "BOOKED"
                     or cell_value == "WEDFAIRE"
                     or cell_value.startswith("BOOKED,")
@@ -631,7 +622,9 @@ def create_booking_pace_chart(df, days=30):
                     "date": parsed,
                     "day_str": day_str,
                     str(current_year): int(current_val) if current_val else 0,
-                    str(last_year): int(last_val) if last_val else 0
+                    # None (not 0) when the cell is blank, so the line shows a
+                    # gap instead of plunging to zero.
+                    str(last_year): int(last_val) if str(last_val).strip() else None
                 })
         except (ValueError, TypeError):
             continue
@@ -649,7 +642,7 @@ def create_booking_pace_chart(df, days=30):
     current_values = [d[str(current_year)] for d in chart_data]
     last_values = [d[str(last_year)] for d in chart_data]
     
-    # 2026 line (primary)
+    # Current-year line (primary)
     fig.add_trace(go.Scatter(
         x=dates,
         y=current_values,
@@ -744,7 +737,9 @@ def create_booking_pace_chart_ytd(df):
                         "date": parsed,
                         "day_str": day_str,
                         str(current_year): int(current_val) if current_val else 0,
-                        str(last_year): int(last_val) if last_val else 0
+                        # None (not 0) when the cell is blank, so the line
+                        # shows a gap instead of plunging to zero.
+                        str(last_year): int(last_val) if str(last_val).strip() else None
                     })
         except (ValueError, TypeError):
             continue
@@ -829,37 +824,20 @@ def _check_required_columns(df, required, source):
 
 
 def calculate_lead_metrics(df):
-    """Calculate lead time and conversion metrics for 2026 events."""
+    """Calculate lead time and conversion metrics for EVENT_YEAR events."""
     if df is None or df.empty:
         return {}
     _check_required_columns(df, REQUIRED_INQUIRY_COLUMNS, "Inquiry Tracker")
-    # Filter for 2026 events (by Event Date, not Timestamp)
-    def is_2026_event(event_date_str):
-        if not event_date_str or str(event_date_str).strip() == "":
-            return False
-        try:
-            # Try various date formats
-            for fmt in ["%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"]:
-                try:
-                    dt = pd.to_datetime(event_date_str, format=fmt)
-                    return dt.year == 2026
-                except:
-                    continue
-            # Fallback to pandas auto-parse
-            dt = pd.to_datetime(event_date_str, errors="coerce")
-            return pd.notna(dt) and dt.year == 2026
-        except:
-            return False
-    
-    df_2026_events = df[df["Event Date"].apply(is_2026_event)].copy()
-    
-    if df_2026_events.empty:
+    # Filter by Event Date (not Timestamp)
+    df_year_events = df[df["Event Date"].apply(lambda v: _is_year(v, EVENT_YEAR))].copy()
+
+    if df_year_events.empty:
         return {}
     
     # For conversion calculations, only use rows with BOTH Inquiry Date AND Decision Date
-    df_with_dates = df_2026_events[
-        (df_2026_events["Inquiry Date"].astype(str).str.strip() != "") &
-        (df_2026_events["Decision Date"].astype(str).str.strip() != "")
+    df_with_dates = df_year_events[
+        (df_year_events["Inquiry Date"].astype(str).str.strip() != "") &
+        (df_year_events["Decision Date"].astype(str).str.strip() != "")
     ].copy()
     
     if df_with_dates.empty:
@@ -869,16 +847,16 @@ def calculate_lead_metrics(df):
     
     # DEBUG: Track filtering steps
     metrics["_debug"] = {
-        "total_2026_events": len(df_2026_events),
+        "total_year_events": len(df_year_events),
         "with_both_dates": len(df_with_dates),
-        "booked_before_filter": len(df_2026_events[df_2026_events["Resolution"] == "Booked"]),
+        "booked_before_filter": len(df_year_events[df_year_events["Resolution"] == "Booked"]),
         "booked_with_dates": len(df_with_dates[df_with_dates["Resolution"] == "Booked"]),
     }
     
     # Find booked events missing dates
-    booked_2026 = df_2026_events[df_2026_events["Resolution"] == "Booked"]
-    booked_missing_inquiry = booked_2026[booked_2026["Inquiry Date"].astype(str).str.strip() == ""]
-    booked_missing_decision = booked_2026[booked_2026["Decision Date"].astype(str).str.strip() == ""]
+    booked_year = df_year_events[df_year_events["Resolution"] == "Booked"]
+    booked_missing_inquiry = booked_year[booked_year["Inquiry Date"].astype(str).str.strip() == ""]
+    booked_missing_decision = booked_year[booked_year["Decision Date"].astype(str).str.strip() == ""]
     
     metrics["_debug"]["booked_missing_inquiry_date"] = len(booked_missing_inquiry)
     metrics["_debug"]["booked_missing_decision_date"] = len(booked_missing_decision)
@@ -905,16 +883,16 @@ def calculate_lead_metrics(df):
     metrics["cold"] = resolution_counts.get("Cold", 0)
     metrics["we_turn_down"] = resolution_counts.get("We turn down", 0)
 
-    # Pre-dedup count of 2026 cancellations (see get_inquiry_tracker_data).
+    # Pre-dedup count of EVENT_YEAR cancellations (see get_inquiry_tracker_data).
     # Lets the UI show that total Booked passed through a higher peak.
-    if "_canceled_2026_predup" in df.columns and len(df) > 0:
-        metrics["canceled_pre_dedup_2026"] = int(df["_canceled_2026_predup"].iloc[0])
-        metrics["canceled_post_booking_2026"] = int(df["_canceled_post_booking_2026"].iloc[0])
-        metrics["canceled_pre_booking_2026"] = int(df["_canceled_pre_booking_2026"].iloc[0])
+    if "_canceled_predup" in df.columns and len(df) > 0:
+        metrics["canceled_pre_dedup"] = int(df["_canceled_predup"].iloc[0])
+        metrics["canceled_post_booking"] = int(df["_canceled_post_booking"].iloc[0])
+        metrics["canceled_pre_booking"] = int(df["_canceled_pre_booking"].iloc[0])
     else:
-        metrics["canceled_pre_dedup_2026"] = 0
-        metrics["canceled_post_booking_2026"] = 0
-        metrics["canceled_pre_booking_2026"] = 0
+        metrics["canceled_pre_dedup"] = 0
+        metrics["canceled_post_booking"] = 0
+        metrics["canceled_pre_booking"] = 0
     metrics["canceled"] = resolution_counts.get("Canceled", 0)
     
     # Conversion rate (simple)
@@ -923,22 +901,26 @@ def calculate_lead_metrics(df):
     else:
         metrics["conversion_rate_simple"] = 0
     
-    # Conversion rate (adjusted) - excludes capacity constraints and non-engagements
-    # Exclude: Full, We turn down, Cold ONLY when "Never acknowledged"
-    cold_never_acknowledged = len(df_with_dates[
-        (df_with_dates["Resolution"] == "Cold") &
-        (df_with_dates["Level of interaction"].str.strip().str.lower() == "never acknowledged")
-    ])
-    
-    adjusted_denominator = (metrics["total_inquiries"] 
-                           - metrics["full"] 
+    # Conversion rate (adjusted) - excludes capacity constraints, cold ghosts
+    # (never confirmed receipt of the initial email; see _is_cold_ghost), and
+    # venue handoffs (not sales events; see _is_aag_handoff).
+    ghost_mask = df_with_dates.apply(_is_cold_ghost, axis=1)
+    cold_never_acknowledged = int(ghost_mask.sum())
+
+    handoff_mask = df_with_dates.apply(_is_aag_handoff, axis=1)
+    handoffs_with_dates = int(handoff_mask.sum())
+    booked_handoffs = int((handoff_mask & (df_with_dates["Resolution"] == "Booked")).sum())
+
+    adjusted_denominator = (metrics["total_inquiries"]
+                           - metrics["full"]
                            - metrics["we_turn_down"]
-                           - cold_never_acknowledged)
+                           - cold_never_acknowledged
+                           - handoffs_with_dates)
     if adjusted_denominator > 0:
-        metrics["conversion_rate"] = metrics["booked"] / adjusted_denominator * 100
+        metrics["conversion_rate"] = (metrics["booked"] - booked_handoffs) / adjusted_denominator * 100
     else:
         metrics["conversion_rate"] = 0
-    
+
     # Store for display
     metrics["cold_never_acknowledged"] = cold_never_acknowledged
     
@@ -951,10 +933,7 @@ def calculate_lead_metrics(df):
         
         # Calculate lead time (Event Date - Inquiry Date)
         try:
-            event_date = pd.to_datetime(row["Event Date"], format="%m/%d/%y", errors="coerce")
-            if pd.isna(event_date):
-                event_date = pd.to_datetime(row["Event Date"], errors="coerce")
-            
+            event_date = _parse_event_date(row["Event Date"])
             inquiry_date = pd.to_datetime(row["Inquiry Date"], errors="coerce")
             
             if pd.notna(event_date) and pd.notna(inquiry_date):
@@ -1005,8 +984,10 @@ def calculate_lead_metrics(df):
             }
     
     # Conversion by source
-    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
-    source_counts = df_with_dates.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
+    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures).
+    # Venue handoffs and cold ghosts excluded entirely, matching the headline rate.
+    df_sales = df_with_dates[~handoff_mask & ~ghost_mask]
+    source_counts = df_sales.groupby("Initial Contact")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_source"] = {}
     for source in source_counts.index:
         row = source_counts.loc[source]
@@ -1025,8 +1006,9 @@ def calculate_lead_metrics(df):
             }
     
     # Level of interaction analysis
-    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures)
-    interaction_counts = df_with_dates.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
+    # Exclude Full and Turn-away from denominator (capacity constraints, not sales failures).
+    # Handoffs excluded (same reasoning as by-source).
+    interaction_counts = df_sales.groupby("Level of interaction")["Resolution"].value_counts().unstack(fill_value=0)
     metrics["by_interaction"] = {}
     for interaction in interaction_counts.index:
         row = interaction_counts.loc[interaction]
@@ -1044,25 +1026,18 @@ def calculate_lead_metrics(df):
                 "conversion_rate": booked / adjusted_total * 100
             }
     
-    # AAG house DJ bookings (venue handoffs, not sales conversions)
-    # These are: Allied Arts Guild venue, Booked, Never acknowledged
-    venue_col = "Venue (if known)"
-    if venue_col in df_2026_events.columns:
-        # Match variations: "Allied Arts Guild", "AAG", etc.
-        aag_bookings = df_2026_events[
-            (df_2026_events[venue_col].astype(str).str.contains("Allied Arts|AAG", case=False, na=False, regex=True)) &
-            (df_2026_events["Resolution"] == "Booked") &
-            (df_2026_events["Level of interaction"].astype(str).str.lower().str.contains("never", na=False))
-        ]
-        metrics["aag_house_bookings"] = len(aag_bookings)
-    else:
-        metrics["aag_house_bookings"] = 0
+    # House-DJ bookings (venue handoffs, not sales conversions). Same
+    # definition as the exclusion used across all conversion metrics.
+    event_handoff_mask = df_year_events.apply(_is_aag_handoff, axis=1)
+    metrics["aag_house_bookings"] = int(
+        (event_handoff_mask & (df_year_events["Resolution"] == "Booked")).sum()
+    )
     
     return metrics
 
 
 # =============================================================================
-# LEAD-TIME / VELOCITY / SURVIVAL METRICS
+# LEAD-TIME / SURVIVAL METRICS
 # =============================================================================
 
 def _bucket_lead_time(days):
@@ -1096,21 +1071,55 @@ def _is_year(value, year):
     return pd.notna(dt) and dt.year == year
 
 
+# AAG venue-name match for legacy handoff detection. Tolerates the
+# "Alled Arts Guild" misspelling present in the tracker.
+_AAG_VENUE_RE = re.compile(r"all?i?ed\s+arts|aag", re.IGNORECASE)
+
+
 def _is_aag_handoff(row) -> bool:
-    """True if the row is a venue-routed handoff (administrative booking, not
-    a sales event). For now this is almost always Allied Arts Guild — the only
-    venue with an exclusive in-house DJ arrangement that routes couples to us
-    without a sales conversation. See memory/reference_aag_venue_handoffs.md.
+    """True if the row is a venue-routed handoff: the venue assigns us the
+    event and the client never makes a hire/don't-hire decision. Not a sales
+    event, so excluded from conversion metrics.
+
+    Two ways to qualify:
+    1. Initial Contact = "Venue - handoff" (form option added 2026-07-04).
+    2. Legacy rows predating that option: Initial Contact = Venue AND the
+       venue is Allied Arts Guild AND no client interaction.
+
+    A venue-mediated sale (venue runs the whole conversation but the client
+    can still decline — e.g. Little Hills, Domenico) is NOT a handoff and
+    stays in the sales metrics, even at "Never acknowledged".
     """
-    initial = str(row.get("Initial Contact", "")).strip()
+    initial = str(row.get("Initial Contact", "")).strip().lower()
+    if "venue" in initial and "handoff" in initial:
+        return True
+    if initial != "venue":
+        return False
     interaction = str(row.get("Level of interaction", "")).strip().lower()
-    return initial == "Venue" and interaction == "never acknowledged"
+    if interaction != "never acknowledged":
+        return False
+    return bool(_AAG_VENUE_RE.search(str(row.get("Venue (if known)", ""))))
+
+
+def _is_cold_ghost(row) -> bool:
+    """Cold + never acknowledged: the couple never confirmed receipt of Paul's
+    initial detailed email. No sales conversation ever started, so these are
+    excluded from every conversion denominator (they're not a sales failure
+    anyone can act on). Distinct from Cold after engagement, which counts."""
+    return (
+        str(row.get("Resolution", "")).strip().lower() == "cold"
+        and str(row.get("Level of interaction", "")).strip().lower() == "never acknowledged"
+    )
 
 
 def _iter_dated_rows(df, event_year=None):
-    """Yield dicts for rows that have both Inquiry Date and Decision Date parsed."""
+    """Yield dicts for SALES rows that have both Inquiry Date and Decision Date
+    parsed. Venue handoffs and cold ghosts are filtered here so every consumer
+    (buckets, survival curves, source velocity) shares one population."""
     for _, row in df.iterrows():
         if event_year is not None and not _is_year(row.get("Event Date", ""), event_year):
+            continue
+        if _is_aag_handoff(row) or _is_cold_ghost(row):
             continue
         inquiry_dt = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
         decision_dt = pd.to_datetime(row.get("Decision Date"), errors="coerce")
@@ -1123,17 +1132,14 @@ def _iter_dated_rows(df, event_year=None):
             "decision_dt": decision_dt,
             "resolution": str(row.get("Resolution", "")).strip(),
             "source": str(row.get("Initial Contact", "")).strip(),
-            "is_aag_handoff": _is_aag_handoff(row),
         }
 
 
-def calculate_lead_time_buckets(df, event_year=2026):
+def calculate_lead_time_buckets(df, event_year=EVENT_YEAR):
     """Conversion rate and decision velocity per lead-time-at-inquiry bucket.
     AAG venue handoffs excluded — they're admin bookings, not sales events."""
     rows = []
     for r in _iter_dated_rows(df, event_year):
-        if r["is_aag_handoff"]:
-            continue
         if pd.isna(r["event_dt"]):
             continue
         lead_days = (r["event_dt"] - r["inquiry_dt"]).days
@@ -1171,13 +1177,11 @@ def calculate_lead_time_buckets(df, event_year=2026):
     return out
 
 
-def calculate_days_to_decision_by_source(df, event_year=2026, min_count=3):
+def calculate_days_to_decision_by_source(df, event_year=EVENT_YEAR, min_count=3):
     """Days-to-decision per Initial Contact source. Filters out sources with < min_count rows.
     AAG venue handoffs excluded — they'd dominate the 'Venue' source with admin-booking noise."""
     rows = []
     for r in _iter_dated_rows(df, event_year):
-        if r["is_aag_handoff"]:
-            continue
         days = (r["decision_dt"] - r["inquiry_dt"]).days
         if days < 0:
             continue
@@ -1206,64 +1210,7 @@ def calculate_days_to_decision_by_source(df, event_year=2026, min_count=3):
     return out
 
 
-def calculate_velocity_weekly(df, weeks=26, window_weeks=8, avg_deal_size=AVG_DEAL_SIZE):
-    """
-    Trailing-window pipeline velocity, computed weekly.
-
-    Pipeline velocity = (qualified opps × avg deal size × win rate) / avg cycle days.
-    For each of the last `weeks` weeks, look back `window_weeks` weeks of decisions
-    and compute the formula. Uses all rows with both dates regardless of event year,
-    so the metric reflects sales-process performance across the calendar.
-    """
-    rows = []
-    for _, row in df.iterrows():
-        if _is_aag_handoff(row):
-            continue
-        inq = pd.to_datetime(row.get("Inquiry Date"), errors="coerce")
-        dec = pd.to_datetime(row.get("Decision Date"), errors="coerce")
-        if pd.isna(inq) or pd.isna(dec):
-            continue
-        cycle = (dec - inq).days
-        if cycle < 0:
-            continue
-        rows.append({
-            "decision_date": dec,
-            "resolution": str(row.get("Resolution", "")).strip(),
-            "cycle": cycle,
-        })
-
-    if not rows:
-        return []
-
-    vdf = pd.DataFrame(rows)
-    today = datetime.now().date()
-
-    weekly = []
-    for w in range(weeks - 1, -1, -1):
-        end = today - timedelta(days=7 * w)
-        start = end - timedelta(days=7 * window_weeks)
-        window = vdf[
-            (vdf["decision_date"].dt.date > start)
-            & (vdf["decision_date"].dt.date <= end)
-        ]
-        eligible = window[~window["resolution"].isin(CAPACITY_RESOLUTIONS)]
-        opps = len(eligible)
-        booked_count = int((eligible["resolution"] == "Booked").sum())
-        win_rate = (booked_count / opps) if opps > 0 else 0.0
-        avg_cycle = float(eligible["cycle"].mean()) if opps > 0 else 0.0
-        velocity = ((opps * avg_deal_size * win_rate) / avg_cycle) if avg_cycle > 0 else 0.0
-        weekly.append({
-            "week_ending": end,
-            "opps": opps,
-            "booked": booked_count,
-            "win_rate_pct": float(win_rate * 100),
-            "avg_cycle_days": avg_cycle,
-            "velocity_dollars_per_day": float(velocity),
-        })
-    return weekly
-
-
-def calculate_survival_curve(df, event_year=2026, max_days=120):
+def calculate_survival_curve(df, event_year=EVENT_YEAR, max_days=120):
     """
     For each eventual outcome (Booked, Lost), the cumulative % of that cohort
     that has decided by day N after inquiry. Plotted as 100% - this gives a
@@ -1272,8 +1219,6 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     bookers = []
     losers = []
     for r in _iter_dated_rows(df, event_year):
-        if r["is_aag_handoff"]:
-            continue
         days = (r["decision_dt"] - r["inquiry_dt"]).days
         if days < 0:
             continue
@@ -1306,7 +1251,7 @@ def calculate_survival_curve(df, event_year=2026, max_days=120):
     }
 
 
-def calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=120):
+def calculate_survival_curve_by_lead_time(df, event_year=EVENT_YEAR, max_days=120):
     """For each lead-time-at-inquiry bucket, the cumulative % of bookers in
     that bucket who have decided by day N. Used to set bucket-specific
     stale-lead thresholds — short-lead couples decide faster than long-lead
@@ -1317,8 +1262,6 @@ def calculate_survival_curve_by_lead_time(df, event_year=2026, max_days=120):
     """
     bookers_by_bucket: dict[str, list[int]] = {b: [] for b in LEAD_TIME_BUCKETS}
     for r in _iter_dated_rows(df, event_year):
-        if r["is_aag_handoff"]:
-            continue
         if r["resolution"] != "Booked":
             continue
         if pd.isna(r["event_dt"]):
@@ -1416,14 +1359,14 @@ def venue_to_tier_info(name, lookup, default_tier="Tier 4"):
     }
 
 
-def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
+def calculate_metrics_by_tier(df, tier_lookup, event_year=EVENT_YEAR):
     """Conversion + decision velocity per tier. Tier 3 and Tier 4 are rolled
     into 'Tier 3+' to keep sample sizes meaningful. Inquiries at non-wedding
     venues (Wedding Venue? unchecked) are excluded so wedding-pipeline numbers
     aren't diluted by school events, single-org recurring bookings, etc."""
     rows = []
     for _, row in df.iterrows():
-        if _is_aag_handoff(row):
+        if _is_aag_handoff(row) or _is_cold_ghost(row):
             continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
@@ -1469,13 +1412,13 @@ def calculate_metrics_by_tier(df, tier_lookup, event_year=2026):
     return out
 
 
-def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=2026):
+def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=EVENT_YEAR):
     """Conversion sliced by Airtable's Recommended Status (5-value enum).
     Excludes inquiries at non-wedding venues so the slicing reflects the
     wedding sales pipeline only."""
     rows = []
     for _, row in df.iterrows():
-        if _is_aag_handoff(row):
+        if _is_aag_handoff(row) or _is_cold_ghost(row):
             continue
         if not _is_year(row.get("Event Date", ""), event_year):
             continue
@@ -1505,10 +1448,10 @@ def calculate_metrics_by_recommended_status(df, tier_lookup, event_year=2026):
     return out
 
 
-def find_research_targets(venues, tier_lookup, df, event_year=2026):
+def find_research_targets(venues, tier_lookup, df, event_year=EVENT_YEAR):
     """Tier 1/2 venues whose Recommended Status is Unknown — meaning we don't
-    know whether we're on their preferred list. For each, count 2026 inquiries
-    so the operator can prioritize venues sending us business."""
+    know whether we're on their preferred list. For each, count EVENT_YEAR
+    inquiries so the operator can prioritize venues sending us business."""
     inquiry_counts = {}
     for _, row in df.iterrows():
         if _is_aag_handoff(row):
@@ -1538,7 +1481,7 @@ def find_research_targets(venues, tier_lookup, df, event_year=2026):
     return targets
 
 
-def find_outreach_targets(venues, tier_lookup, df, event_year=2026):
+def find_outreach_targets(venues, tier_lookup, df, event_year=EVENT_YEAR):
     """Growth-target venues we know we're not on the preferred list for —
     confirmed outreach candidates."""
     inquiry_counts = {}
@@ -1571,8 +1514,8 @@ def find_outreach_targets(venues, tier_lookup, df, event_year=2026):
     return targets
 
 
-def calculate_growth_target_activity(venues, tier_lookup, df, event_year=2026):
-    """For each Growth Target venue, count 2026 inquiries and how many booked.
+def calculate_growth_target_activity(venues, tier_lookup, df, event_year=EVENT_YEAR):
+    """For each Growth Target venue, count EVENT_YEAR inquiries and how many booked.
     Lets Paul see whether his investment in those venues is showing up."""
     counts = {}
     for _, row in df.iterrows():
@@ -1613,7 +1556,7 @@ FULL_REASON_ARTIFICIAL_CAP = "Artificial Cap (capacity known)"
 FULL_REASON_AAG_HOLD = "Artificial Cap (holding for AAG)"
 
 
-def calculate_full_reasons(df, event_year=2026, full_reason_col="Capacity Status (if Full)"):
+def calculate_full_reasons(df, event_year=EVENT_YEAR, full_reason_col="Capacity Status (if Full)"):
     """
     Break Resolution=Full rows into True Capacity vs Artificial Cap reasons,
     plus an opportunity-cost dollar estimate for the artificial-cap subset.
@@ -1661,44 +1604,6 @@ def calculate_full_reasons(df, event_year=2026, full_reason_col="Capacity Status
 # =============================================================================
 # CHARTS FOR NEW METRICS
 # =============================================================================
-
-def create_velocity_chart(weekly_data):
-    """Line chart of pipeline velocity ($/day) over time."""
-    if not weekly_data:
-        return None
-
-    fig = go.Figure()
-    dates = [d["week_ending"].strftime("%b %d") for d in weekly_data]
-    velocities = [d["velocity_dollars_per_day"] for d in weekly_data]
-
-    fig.add_trace(go.Scatter(
-        x=dates,
-        y=velocities,
-        mode="lines+markers",
-        name="Velocity",
-        line=dict(color="#00D4AA", width=3),
-        marker=dict(size=6),
-        hovertemplate="<b>Week ending %{x}</b><br>$%{y:,.0f}/day<extra></extra>",
-    ))
-
-    fig.update_layout(
-        height=240,
-        margin=dict(l=0, r=0, t=10, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#FFFFFF"),
-        xaxis=dict(showgrid=False, tickangle=-45, dtick=4),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.1)",
-            tickprefix="$",
-            tickformat=",",
-        ),
-        hovermode="x unified",
-        showlegend=False,
-    )
-    return fig
-
 
 def create_lead_time_bucket_chart(buckets):
     """Bar chart of conversion rate by lead-time-at-inquiry bucket."""
@@ -1879,11 +1784,12 @@ def create_full_reason_chart(full_reasons):
         marker_color=colors,
         text=values,
         textposition="auto",
+        cliponaxis=False,
         hovertemplate="<b>%{x}</b><br>%{y} events<extra></extra>",
     ))
     fig.update_layout(
         height=260,
-        margin=dict(l=0, r=0, t=10, b=0),
+        margin=dict(l=0, r=0, t=30, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#FFFFFF"),
@@ -1966,8 +1872,11 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 1: Booking Pace + Inquiries Summary
+    # SALES
     # ==========================================================================
+
+    st.header("📈 Sales")
+
     
     # Pre-calculate metrics for use across sections
     inquiry_df = None
@@ -2008,7 +1917,7 @@ def main():
             else:
                 diff = (current - last_year) if last_year is not None else None
                 st.metric(
-                    label=f"2026 Booked (as of today)",
+                    label=f"{EVENT_YEAR} Booked (as of today)",
                     value=current,
                     delta=f"{diff:+d} vs 2025" if diff else None,
                     delta_color="normal"
@@ -2020,15 +1929,16 @@ def main():
     
     # Inquiries Summary
     with col2:
-        st.subheader("📊 2026 Inquiries")
+        st.subheader(f"📊 {EVENT_YEAR} Inquiries")
         if metrics:
             st.metric("Total Inquiries", metrics.get("total_inquiries", 0))
-            
+            st.caption("Rows with both Inquiry and Decision dates (older rows predate those fields)")
+
             sub_col1, sub_col2 = st.columns(2)
             with sub_col1:
                 booked = metrics.get("booked", 0)
-                canceled_post = metrics.get("canceled_post_booking_2026", 0)
-                canceled_pre = metrics.get("canceled_pre_booking_2026", 0)
+                canceled_post = metrics.get("canceled_post_booking", 0)
+                canceled_pre = metrics.get("canceled_pre_booking", 0)
                 st.metric("Booked", booked)
                 caption_lines = []
                 if canceled_post > 0:
@@ -2057,7 +1967,7 @@ def main():
                         st.write(f"**Deduplication:** {pre} rows → {post} rows ({removed} duplicates removed)")
                         st.write("---")
                     
-                    st.write(f"Total 2026 events in tracker: {debug.get('total_2026_events', '?')}")
+                    st.write(f"Total {EVENT_YEAR} events in tracker: {debug.get('total_year_events', '?')}")
                     st.write(f"Booked (before date filter): {debug.get('booked_before_filter', '?')}")
                     st.write(f"With both Inquiry+Decision dates: {debug.get('with_both_dates', '?')}")
                     st.write(f"Booked (after date filter): {debug.get('booked_with_dates', '?')}")
@@ -2076,7 +1986,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 2: Conversion (all metrics)
+    # SALES: Conversion (all metrics)
     # ==========================================================================
     
     st.subheader("🎯 Conversion")
@@ -2090,7 +2000,7 @@ def main():
             conversion_simple = metrics.get("conversion_rate_simple", 0)
             
             st.metric("Overall Conversion Rate", f"{conversion:.0f}%")
-            st.caption(f"Excludes: Full, Turn-away, Cold (no response)")
+            st.caption(f"Excludes: Full, Turn-away, Cold (no response), venue handoffs")
             st.caption(f"Simple (all inquiries): {conversion_simple:.0f}%")
         
         with conv_col2:
@@ -2098,7 +2008,8 @@ def main():
             by_source = metrics.get("by_source", {})
             for source, data in sorted(by_source.items(), key=lambda x: -x[1]["conversion_rate"]):
                 if data["total"] >= 3:  # Only show sources with meaningful volume
-                    st.text(f"{source[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
+                    label = source.strip() or "(blank)"
+                    st.text(f"{label[:20]}: {data['conversion_rate']:.0f}% ({data['booked']}/{data['total']})")
         
         # Bottom row: By interaction level
         st.markdown("**By Interaction Level:**")
@@ -2149,7 +2060,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 3: Booking Pace Charts
+    # SALES: Booking Pace Charts
     # ==========================================================================
     
     # Booking Pace Charts
@@ -2174,7 +2085,441 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 4: Upcoming Events
+    # SALES: Lead Time Analysis
+    # ==========================================================================
+    
+    st.subheader(f"⏱️ Lead Time Analysis ({EVENT_YEAR})")
+    
+    if metrics and metrics.get("lead_times"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Lead Time by Outcome**")
+            lead_times = metrics.get("lead_times", {})
+            
+            # Create a simple table
+            lt_data = []
+            for resolution, data in lead_times.items():
+                lt_data.append({
+                    "Outcome": resolution,
+                    "Median": f"{data['median_months']:.1f} mo",
+                    "Avg": f"{data['avg_months']:.1f} mo",
+                    "Count": data["count"]
+                })
+            
+            if lt_data:
+                lt_df = pd.DataFrame(lt_data)
+                lt_df = lt_df.sort_values("Count", ascending=False)
+                st.dataframe(lt_df, hide_index=True, use_container_width=True)
+        
+        with col2:
+            st.markdown("**Days to Decision by Outcome**")
+            days_to_dec = metrics.get("days_to_decision", {})
+            
+            dtd_data = []
+            for resolution, data in days_to_dec.items():
+                dtd_data.append({
+                    "Outcome": resolution,
+                    "Avg Days": f"{data['avg_days']:.0f}",
+                    "Median Days": f"{data['median_days']:.0f}",
+                    "Count": data["count"]
+                })
+            
+            if dtd_data:
+                dtd_df = pd.DataFrame(dtd_data)
+                dtd_df = dtd_df.sort_values("Count", ascending=False)
+                st.dataframe(dtd_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("Lead time data requires both Inquiry Date and Decision Date fields")
+
+    # ==========================================================================
+    # SALES: Conversion by Lead Time at Inquiry
+    # ==========================================================================
+
+    st.divider()
+    st.subheader(f"📅 Conversion by Lead Time at Inquiry ({EVENT_YEAR})")
+    st.caption(
+        "How far out a couple was from their event when they inquired vs. how often they "
+        "booked and how fast they decided. Excludes Full / Turn-away from the denominator."
+    )
+
+    lead_buckets = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            lead_buckets = calculate_lead_time_buckets(inquiry_df)
+        except Exception as e:
+            st.caption(f"Bucket calc failed: {str(e)[:100]}")
+
+    if lead_buckets:
+        lt_col1, lt_col2 = st.columns([3, 2])
+
+        with lt_col1:
+            lt_chart = create_lead_time_bucket_chart(lead_buckets)
+            if lt_chart:
+                st.plotly_chart(lt_chart, use_container_width=True)
+
+        with lt_col2:
+            st.markdown("**Decision speed by bucket**")
+            speed_rows = []
+            for b in LEAD_TIME_BUCKETS:
+                if b not in lead_buckets:
+                    continue
+                data = lead_buckets[b]
+                speed_rows.append({
+                    "Lead time": b,
+                    "Median days": f"{data['median_days_to_decision']:.0f}",
+                    "Booked / Eligible": f"{data['booked']}/{data['eligible']}",
+                })
+            if speed_rows:
+                st.dataframe(
+                    pd.DataFrame(speed_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+    else:
+        st.info("No lead-time bucket data available")
+
+    # ==========================================================================
+    # SALES: Days to Decision by Lead Source
+    # ==========================================================================
+
+    st.divider()
+    st.subheader(f"🎯 Decision Velocity by Lead Source ({EVENT_YEAR})")
+    st.caption(
+        "How fast leads from each source actually decide. Sources with fewer than "
+        "3 decisions are hidden."
+    )
+
+    source_dtd = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            source_dtd = calculate_days_to_decision_by_source(inquiry_df)
+        except Exception as e:
+            st.caption(f"Source calc failed: {str(e)[:100]}")
+
+    if source_dtd:
+        source_rows = []
+        for source, data in source_dtd.items():
+            source_rows.append({
+                "Source": source[:30],
+                "Median days (booked)": (
+                    f"{data['median_days_booked']:.0f}"
+                    if data["median_days_booked"] is not None else "—"
+                ),
+                "Median days (all)": f"{data['median_days_all']:.0f}",
+                "Booked / Total": f"{data['booked_count']}/{data['count']}",
+            })
+
+        # Sort by booked-median ascending; sources with no bookings sink to the bottom
+        def sort_key(r):
+            v = r["Median days (booked)"]
+            return float(v) if v != "—" else float("inf")
+
+        source_rows.sort(key=sort_key)
+        st.dataframe(
+            pd.DataFrame(source_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No source data available")
+
+    # ==========================================================================
+    # SALES: Survival / Decision Curve
+    # ==========================================================================
+
+    st.divider()
+    st.subheader(f"📉 Decision Curve ({EVENT_YEAR})")
+    st.caption(
+        "Of couples who eventually booked or were lost, what % were still undecided "
+        "at day N. Booked drops fast; Lost takes longer."
+    )
+
+    survival = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            survival = calculate_survival_curve(inquiry_df)
+        except Exception as e:
+            st.caption(f"Survival calc failed: {str(e)[:100]}")
+
+    if survival and (survival.get("Booked") or survival.get("Lost")):
+        s_chart = create_survival_curve_chart(survival)
+        if s_chart:
+            st.plotly_chart(s_chart, use_container_width=True)
+    else:
+        st.info("No survival data available")
+
+    # SALES: Decision Curve faceted by lead-time-at-inquiry bucket.
+    # Used for setting bucket-specific stale-lead thresholds in MailMaven.
+    st.divider()
+    st.subheader(f"📉 Decision Curve by Lead Time ({EVENT_YEAR} bookers)")
+    st.caption(
+        "Same survival curve, but split by how far out the couple was when "
+        "they inquired. Short-lead couples decide faster than long-lead ones — "
+        "so 'when can I stop chasing' should vary by bucket. Read the day where "
+        "each curve flattens and use that as your stale-lead threshold for "
+        "that bucket."
+    )
+
+    survival_by_lt = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            survival_by_lt = calculate_survival_curve_by_lead_time(inquiry_df)
+        except Exception as e:
+            st.caption(f"Faceted survival calc failed: {str(e)[:100]}")
+
+    if survival_by_lt:
+        slt_chart = create_survival_curve_by_lead_time_chart(survival_by_lt)
+        if slt_chart:
+            st.plotly_chart(slt_chart, use_container_width=True)
+    else:
+        st.info("No bucket-faceted survival data available")
+
+    # ==========================================================================
+    # CAPACITY
+    # ==========================================================================
+
+    st.divider()
+    st.header("🏗️ Capacity")
+    st.subheader(f"Capacity Reality ({EVENT_YEAR})")
+    st.caption(
+        "Splits Full events into True Capacity (we genuinely had no DJ available) "
+        "vs Artificial Cap (we declined the date despite having capacity, including "
+        "dates held for AAG). Artificial caps represent revenue we chose not to take."
+    )
+
+    full_reasons = {}
+    if inquiry_df is not None and not inquiry_df.empty:
+        try:
+            full_reasons = calculate_full_reasons(inquiry_df)
+        except Exception as e:
+            st.caption(f"Capacity Reality calc failed: {str(e)[:100]}")
+
+    if full_reasons and full_reasons.get("total_full", 0) > 0:
+        cap_col1, cap_col2, cap_col3 = st.columns(3)
+        with cap_col1:
+            categorized = full_reasons["true_capacity_total"] + full_reasons["artificial_total"]
+            st.metric(f"Categorized Full ({EVENT_YEAR})", categorized)
+            unspec = full_reasons.get("unspecified_total", 0)
+            if unspec > 0:
+                st.caption(f"({unspec} additional Full rows predate the Capacity Status field)")
+        with cap_col2:
+            artificial = full_reasons["artificial_total"]
+            true_cap = full_reasons["true_capacity_total"]
+            st.metric("Artificial Cap", artificial)
+            if artificial + true_cap > 0:
+                share = artificial / (artificial + true_cap) * 100
+                st.caption(f"{share:.0f}% of categorized Fulls are policy-driven")
+        with cap_col3:
+            st.metric(
+                "Potential revenue declined",
+                f"${full_reasons['artificial_potential_revenue']:,.0f}",
+            )
+            st.caption(f"= {artificial} × ${AVG_DEAL_SIZE:,} avg deal")
+
+        cap_chart = create_full_reason_chart(full_reasons)
+        if cap_chart:
+            st.plotly_chart(cap_chart, use_container_width=True)
+    else:
+        st.info(f"No {EVENT_YEAR} Full events to analyze yet")
+
+    # ==========================================================================
+    # VENUES: tier slicing + action lists (reads Airtable Venues table)
+    # ==========================================================================
+
+    venues = []
+    tier_lookup = {}
+    try:
+        venues = get_venue_tiers_from_airtable()
+        tier_lookup = build_venue_tier_lookup(venues)
+    except Exception as e:
+        st.caption(f"Could not load venue tiers from Airtable: {str(e)[:120]}")
+
+    if venues and inquiry_df is not None and not inquiry_df.empty:
+        st.divider()
+        st.header("🏛️ Venues")
+        st.subheader(f"Conversion by Venue Tier ({EVENT_YEAR})")
+        excluded_count = sum(1 for v in venues if not v.get("wedding_venue", True))
+        if excluded_count > 0:
+            st.caption(
+                f"Slices conversion and decision velocity by venue tier "
+                f"(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
+                f"for sample-size discipline. **{excluded_count} non-wedding venues** "
+                "(schools, single-org recurring, etc.) excluded from wedding-pipeline analytics."
+            )
+        else:
+            st.caption(
+                "Slices conversion and decision velocity by venue tier "
+                "(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
+                "for sample-size discipline."
+            )
+        try:
+            tier_metrics = calculate_metrics_by_tier(inquiry_df, tier_lookup)
+        except Exception as e:
+            tier_metrics = {}
+            st.caption(f"Tier calc failed: {str(e)[:100]}")
+        if tier_metrics:
+            tier_rows = []
+            for group in ["Tier 1", "Tier 2", "Tier 3+"]:
+                if group not in tier_metrics:
+                    continue
+                m = tier_metrics[group]
+                tier_rows.append({
+                    "Tier": group,
+                    "Conversion": f"{m['conversion_rate']:.0f}%",
+                    "Median days to decision": f"{m['median_days_to_decision']:.0f}",
+                    "Median lead time (days)": f"{m['median_lead_days']:.0f}",
+                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                    "Total inquiries": m["count"],
+                })
+            st.dataframe(pd.DataFrame(tier_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info(f"No tier-classifiable inquiries for {EVENT_YEAR} yet")
+
+        # VENUES: Conversion by Recommended Status
+        st.divider()
+        st.subheader(f"🤝 Conversion by Recommended Status ({EVENT_YEAR})")
+        st.caption(
+            "How conversion varies based on whether BIG FUN is on the venue's "
+            "preferred-vendor list. Hypothesis: 'Yes, with hard evidence' should "
+            "outperform 'No, with hard evidence'. Empty rows mean no inquiries "
+            "from venues in that status."
+        )
+        try:
+            status_metrics = calculate_metrics_by_recommended_status(inquiry_df, tier_lookup)
+        except Exception as e:
+            status_metrics = {}
+            st.caption(f"Status calc failed: {str(e)[:100]}")
+        if status_metrics:
+            STATUS_ORDER = [
+                "Yes, with hard evidence",
+                "Yes/Likely, with no hard evidence",
+                "Unknown",
+                "Unlikely",
+                "No, with hard evidence",
+            ]
+            status_rows = []
+            seen = set()
+            for s in STATUS_ORDER:
+                if s in status_metrics:
+                    m = status_metrics[s]
+                    status_rows.append({
+                        "Recommended Status": s,
+                        "Conversion": f"{m['conversion_rate']:.0f}%",
+                        "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                        "Total inquiries": m["count"],
+                    })
+                    seen.add(s)
+            # Surface anything we didn't expect (defensive)
+            for s, m in status_metrics.items():
+                if s in seen:
+                    continue
+                status_rows.append({
+                    "Recommended Status": s or "(blank)",
+                    "Conversion": f"{m['conversion_rate']:.0f}%",
+                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
+                    "Total inquiries": m["count"],
+                })
+            st.dataframe(pd.DataFrame(status_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info(f"No status-classifiable inquiries for {EVENT_YEAR} yet")
+
+        # VENUES: Action lists — Research / Outreach / Growth Targets
+        st.divider()
+        st.subheader("🎯 Action lists")
+        action_col1, action_col2 = st.columns(2)
+
+        with action_col1:
+            st.markdown("**🔍 Research Targets**")
+            st.caption(
+                f"Tier 1/2 venues where we don't know whether we're on their preferred list. "
+                f"Sorted by {EVENT_YEAR} inquiry volume — chase the ones sending us business first."
+            )
+            try:
+                research = find_research_targets(venues, tier_lookup, inquiry_df)
+            except Exception as e:
+                research = []
+                st.caption(f"Research-targets calc failed: {str(e)[:100]}")
+            if research:
+                research_rows = [
+                    {
+                        "Venue": t["name"][:40],
+                        "Tier": t["tier"],
+                        f"Inquiries ({EVENT_YEAR})": t["inquiries_this_year"],
+                    }
+                    for t in research
+                ]
+                st.dataframe(pd.DataFrame(research_rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("All Tier 1/2 venues have a known preferred-list status")
+
+        with action_col2:
+            st.markdown("**📤 Outreach Targets**")
+            st.caption(
+                "Growth-target venues we've confirmed we're not on the preferred list for. "
+                "Highest-priority outreach — declared intent + known gap."
+            )
+            try:
+                outreach = find_outreach_targets(venues, tier_lookup, inquiry_df)
+            except Exception as e:
+                outreach = []
+                st.caption(f"Outreach-targets calc failed: {str(e)[:100]}")
+            if outreach:
+                outreach_rows = [
+                    {
+                        "Venue": t["name"][:35],
+                        "Tier": t["tier"],
+                        "Status": t["recommended_status"],
+                        f"Inquiries ({EVENT_YEAR})": t["inquiries_this_year"],
+                    }
+                    for t in outreach
+                ]
+                st.dataframe(pd.DataFrame(outreach_rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("No outreach targets — fill in Recommended Status for growth-target venues")
+
+        # Growth Target activity (full width)
+        st.markdown("**🌱 Growth Target Activity**")
+        st.caption(
+            "Recent inquiry and booking counts for every venue you've flagged as a growth target. "
+            "If a flagged venue isn't generating inquiries over time, the bet isn't paying off."
+        )
+        try:
+            gt_activity = calculate_growth_target_activity(venues, tier_lookup, inquiry_df)
+        except Exception as e:
+            gt_activity = []
+            st.caption(f"Growth-target calc failed: {str(e)[:100]}")
+        if gt_activity:
+            gt_rows = [
+                {
+                    "Venue": v["name"][:45],
+                    "Tier": v["tier"],
+                    "Status": v["recommended_status"],
+                    f"{EVENT_YEAR} Inquiries": v["inquiries"],
+                    f"{EVENT_YEAR} Booked": v["booked"],
+                }
+                for v in gt_activity
+            ]
+            st.dataframe(pd.DataFrame(gt_rows), hide_index=True, use_container_width=True)
+        else:
+            st.info("No growth-target venues flagged. Check the Airtable Venues table.")
+    elif inquiry_df is not None:
+        st.divider()
+        st.caption(
+            "Venue tier sections require an Airtable Personal Access Token. "
+            "Add it to Streamlit secrets as `airtable_pat`, or to macOS Keychain via "
+            "`security add-generic-password -s bigfun-airtable-pat -a paul -w <PAT> -U` for local dev."
+        )
+
+    # ==========================================================================
+    # OPERATIONS
+    # ==========================================================================
+
+    st.divider()
+    st.header("🎧 Operations")
+
+    # ==========================================================================
+    # OPERATIONS: Upcoming Events
     # ==========================================================================
     
     st.subheader("📅 Upcoming Events (Next 14 Days)")
@@ -2227,13 +2572,13 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # ROW 5: DJ Bookings by Person
+    # OPERATIONS: DJ Bookings by Person
     # ==========================================================================
     
-    st.subheader("🎧 Events Booked by DJ (2026)")
+    st.subheader(f"🎧 Events Booked by DJ ({EVENT_YEAR})")
     
     try:
-        dj_counts = get_dj_booking_counts(2026)
+        dj_counts = get_dj_booking_counts(EVENT_YEAR)
         
         if dj_counts:
             # Separate TBA from assigned DJs
@@ -2244,9 +2589,9 @@ def main():
             # co-DJ event counts once), excluding setups. Distinct from the
             # per-DJ tallies below, which are assignments and sum higher whenever
             # an event has more than one DJ.
-            events, setups = get_event_count(2026)
+            events, setups = get_event_count(EVENT_YEAR)
             if events is not None:
-                ev_label = f"Events (2026){f' — {setups} setup(s) excluded' if setups else ''}"
+                ev_label = f"Events ({EVENT_YEAR}){f' — {setups} setup(s) excluded' if setups else ''}"
                 st.metric(ev_label, events)
 
             # Sort assigned DJs by count descending
@@ -2258,8 +2603,8 @@ def main():
 
             if events is not None:
                 st.caption(
-                    f"Per-DJ numbers are assignments (a co-DJ event is credited to both DJs), "
-                    f"so they total {assigned_total} — more than the {events} events. "
+                    f"Per-DJ numbers are assignments (a co-DJ event is credited to both DJs): "
+                    f"{assigned_total} assignments across {events} events. "
                     f"Unassigned (TBA): {tba_count}."
                 )
             else:
@@ -2271,474 +2616,6 @@ def main():
     
     st.divider()
     
-    # ==========================================================================
-    # ROW 6: Lead Time Analysis
-    # ==========================================================================
-    
-    st.subheader("⏱️ Lead Time Analysis (2026)")
-    
-    if metrics and metrics.get("lead_times"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Lead Time by Outcome**")
-            lead_times = metrics.get("lead_times", {})
-            
-            # Create a simple table
-            lt_data = []
-            for resolution, data in lead_times.items():
-                lt_data.append({
-                    "Outcome": resolution,
-                    "Median": f"{data['median_months']:.1f} mo",
-                    "Avg": f"{data['avg_months']:.1f} mo",
-                    "Count": data["count"]
-                })
-            
-            if lt_data:
-                lt_df = pd.DataFrame(lt_data)
-                lt_df = lt_df.sort_values("Count", ascending=False)
-                st.dataframe(lt_df, hide_index=True, use_container_width=True)
-        
-        with col2:
-            st.markdown("**Days to Decision by Outcome**")
-            days_to_dec = metrics.get("days_to_decision", {})
-            
-            dtd_data = []
-            for resolution, data in days_to_dec.items():
-                dtd_data.append({
-                    "Outcome": resolution,
-                    "Avg Days": f"{data['avg_days']:.0f}",
-                    "Median Days": f"{data['median_days']:.0f}",
-                    "Count": data["count"]
-                })
-            
-            if dtd_data:
-                dtd_df = pd.DataFrame(dtd_data)
-                dtd_df = dtd_df.sort_values("Count", ascending=False)
-                st.dataframe(dtd_df, hide_index=True, use_container_width=True)
-    else:
-        st.info("Lead time data requires both Inquiry Date and Decision Date fields")
-
-    # ==========================================================================
-    # ROW 7: Pipeline Velocity (8-week trailing window, weekly cadence)
-    # ==========================================================================
-
-    st.divider()
-    st.subheader("⚡ Pipeline Velocity")
-    st.caption(
-        f"(Qualified opps × ${AVG_DEAL_SIZE:,} avg deal × win rate) ÷ avg cycle days. "
-        "Weekly snapshots over the last 6 months, each computed on a trailing 8-week window."
-    )
-
-    velocity_weekly = []
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            velocity_weekly = calculate_velocity_weekly(inquiry_df)
-        except Exception as e:
-            st.caption(f"Velocity calc failed: {str(e)[:100]}")
-
-    if velocity_weekly:
-        latest = velocity_weekly[-1]
-        # Compare to ~1 month back (4 weekly snapshots)
-        prior = velocity_weekly[-5] if len(velocity_weekly) >= 5 else velocity_weekly[0]
-
-        v_col1, v_col2, v_col3 = st.columns(3)
-        with v_col1:
-            delta = latest["velocity_dollars_per_day"] - prior["velocity_dollars_per_day"]
-            st.metric(
-                "Velocity (this week)",
-                f"${latest['velocity_dollars_per_day']:,.0f}/day",
-                delta=f"{delta:+,.0f}/day vs 4 wk ago" if abs(delta) >= 1 else None,
-            )
-        with v_col2:
-            st.metric("Win rate (window)", f"{latest['win_rate_pct']:.0f}%")
-        with v_col3:
-            st.metric("Avg cycle (window)", f"{latest['avg_cycle_days']:.0f} days")
-
-        v_chart = create_velocity_chart(velocity_weekly)
-        if v_chart:
-            st.plotly_chart(v_chart, use_container_width=True)
-    else:
-        st.info("Not enough decided inquiries to compute velocity")
-
-    # ==========================================================================
-    # ROW 8: Conversion by Lead Time at Inquiry
-    # ==========================================================================
-
-    st.divider()
-    st.subheader("📅 Conversion by Lead Time at Inquiry (2026)")
-    st.caption(
-        "How far out a couple was from their event when they inquired vs. how often they "
-        "booked and how fast they decided. Excludes Full / Turn-away from the denominator."
-    )
-
-    lead_buckets = {}
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            lead_buckets = calculate_lead_time_buckets(inquiry_df)
-        except Exception as e:
-            st.caption(f"Bucket calc failed: {str(e)[:100]}")
-
-    if lead_buckets:
-        lt_col1, lt_col2 = st.columns([3, 2])
-
-        with lt_col1:
-            lt_chart = create_lead_time_bucket_chart(lead_buckets)
-            if lt_chart:
-                st.plotly_chart(lt_chart, use_container_width=True)
-
-        with lt_col2:
-            st.markdown("**Decision speed by bucket**")
-            speed_rows = []
-            for b in LEAD_TIME_BUCKETS:
-                if b not in lead_buckets:
-                    continue
-                data = lead_buckets[b]
-                speed_rows.append({
-                    "Lead time": b,
-                    "Median days": f"{data['median_days_to_decision']:.0f}",
-                    "Booked / Eligible": f"{data['booked']}/{data['eligible']}",
-                })
-            if speed_rows:
-                st.dataframe(
-                    pd.DataFrame(speed_rows),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-    else:
-        st.info("No lead-time bucket data available")
-
-    # ==========================================================================
-    # ROW 9: Days to Decision by Lead Source
-    # ==========================================================================
-
-    st.divider()
-    st.subheader("🎯 Decision Velocity by Lead Source (2026)")
-    st.caption(
-        "How fast leads from each source actually decide. Sources with fewer than "
-        "3 decisions are hidden."
-    )
-
-    source_dtd = {}
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            source_dtd = calculate_days_to_decision_by_source(inquiry_df)
-        except Exception as e:
-            st.caption(f"Source calc failed: {str(e)[:100]}")
-
-    if source_dtd:
-        source_rows = []
-        for source, data in source_dtd.items():
-            source_rows.append({
-                "Source": source[:30],
-                "Median days (booked)": (
-                    f"{data['median_days_booked']:.0f}"
-                    if data["median_days_booked"] is not None else "—"
-                ),
-                "Median days (all)": f"{data['median_days_all']:.0f}",
-                "Booked / Total": f"{data['booked_count']}/{data['count']}",
-            })
-
-        # Sort by booked-median ascending; sources with no bookings sink to the bottom
-        def sort_key(r):
-            v = r["Median days (booked)"]
-            return float(v) if v != "—" else float("inf")
-
-        source_rows.sort(key=sort_key)
-        st.dataframe(
-            pd.DataFrame(source_rows),
-            hide_index=True,
-            use_container_width=True,
-        )
-    else:
-        st.info("No source data available")
-
-    # ==========================================================================
-    # ROW 10: Survival / Decision Curve
-    # ==========================================================================
-
-    st.divider()
-    st.subheader("📉 Decision Curve (2026)")
-    st.caption(
-        "Of couples who eventually booked or were lost, what % were still undecided "
-        "at day N. Booked drops fast; Lost takes longer."
-    )
-
-    survival = {}
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            survival = calculate_survival_curve(inquiry_df)
-        except Exception as e:
-            st.caption(f"Survival calc failed: {str(e)[:100]}")
-
-    if survival and (survival.get("Booked") or survival.get("Lost")):
-        s_chart = create_survival_curve_chart(survival)
-        if s_chart:
-            st.plotly_chart(s_chart, use_container_width=True)
-    else:
-        st.info("No survival data available")
-
-    # ROW 10b: Decision Curve faceted by lead-time-at-inquiry bucket.
-    # Used for setting bucket-specific stale-lead thresholds in MailMaven.
-    st.divider()
-    st.subheader("📉 Decision Curve by Lead Time (2026 bookers)")
-    st.caption(
-        "Same survival curve, but split by how far out the couple was when "
-        "they inquired. Short-lead couples decide faster than long-lead ones — "
-        "so 'when can I stop chasing' should vary by bucket. Read the day where "
-        "each curve flattens and use that as your stale-lead threshold for "
-        "that bucket."
-    )
-
-    survival_by_lt = {}
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            survival_by_lt = calculate_survival_curve_by_lead_time(inquiry_df)
-        except Exception as e:
-            st.caption(f"Faceted survival calc failed: {str(e)[:100]}")
-
-    if survival_by_lt:
-        slt_chart = create_survival_curve_by_lead_time_chart(survival_by_lt)
-        if slt_chart:
-            st.plotly_chart(slt_chart, use_container_width=True)
-    else:
-        st.info("No bucket-faceted survival data available")
-
-    # ==========================================================================
-    # ROW 11: Capacity Reality (Full reasons)
-    # ==========================================================================
-
-    st.divider()
-    st.subheader("🏗️ Capacity Reality (2026)")
-    st.caption(
-        "Splits Full events into True Capacity (we genuinely had no DJ available) "
-        "vs Artificial Cap (we declined the date despite having capacity, including "
-        "dates held for AAG). Artificial caps represent revenue we chose not to take."
-    )
-
-    full_reasons = {}
-    if inquiry_df is not None and not inquiry_df.empty:
-        try:
-            full_reasons = calculate_full_reasons(inquiry_df)
-        except Exception as e:
-            st.caption(f"Capacity Reality calc failed: {str(e)[:100]}")
-
-    if full_reasons and full_reasons.get("total_full", 0) > 0:
-        cap_col1, cap_col2, cap_col3 = st.columns(3)
-        with cap_col1:
-            categorized = full_reasons["true_capacity_total"] + full_reasons["artificial_total"]
-            st.metric("Categorized Full (2026)", categorized)
-            unspec = full_reasons.get("unspecified_total", 0)
-            if unspec > 0:
-                st.caption(f"({unspec} additional Full rows predate the Capacity Status field)")
-        with cap_col2:
-            artificial = full_reasons["artificial_total"]
-            true_cap = full_reasons["true_capacity_total"]
-            st.metric("Artificial Cap", artificial)
-            if artificial + true_cap > 0:
-                share = artificial / (artificial + true_cap) * 100
-                st.caption(f"{share:.0f}% of categorized Fulls are policy-driven")
-        with cap_col3:
-            st.metric(
-                "Potential revenue declined",
-                f"${full_reasons['artificial_potential_revenue']:,.0f}",
-            )
-            st.caption(f"= {artificial} × ${AVG_DEAL_SIZE:,} avg deal")
-
-        cap_chart = create_full_reason_chart(full_reasons)
-        if cap_chart:
-            st.plotly_chart(cap_chart, use_container_width=True)
-    else:
-        st.info("No 2026 Full events to analyze yet")
-
-    # ==========================================================================
-    # ROWS 12-14: Venue tier slicing (reads Airtable Venues table)
-    # ==========================================================================
-
-    venues = []
-    tier_lookup = {}
-    try:
-        venues = get_venue_tiers_from_airtable()
-        tier_lookup = build_venue_tier_lookup(venues)
-    except Exception as e:
-        st.caption(f"Could not load venue tiers from Airtable: {str(e)[:120]}")
-
-    if venues and inquiry_df is not None and not inquiry_df.empty:
-        # ROW 12: Conversion by Venue Tier
-        st.divider()
-        st.subheader("🏛️ Conversion by Venue Tier (2026)")
-        excluded_count = sum(1 for v in venues if not v.get("wedding_venue", True))
-        if excluded_count > 0:
-            st.caption(
-                f"Slices conversion and decision velocity by venue tier "
-                f"(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
-                f"for sample-size discipline. **{excluded_count} non-wedding venues** "
-                "(schools, single-org recurring, etc.) excluded from wedding-pipeline analytics."
-            )
-        else:
-            st.caption(
-                "Slices conversion and decision velocity by venue tier "
-                "(see venue-tier-framework.md). Tier 3 and Tier 4 rolled together "
-                "for sample-size discipline."
-            )
-        try:
-            tier_metrics = calculate_metrics_by_tier(inquiry_df, tier_lookup)
-        except Exception as e:
-            tier_metrics = {}
-            st.caption(f"Tier calc failed: {str(e)[:100]}")
-        if tier_metrics:
-            tier_rows = []
-            for group in ["Tier 1", "Tier 2", "Tier 3+"]:
-                if group not in tier_metrics:
-                    continue
-                m = tier_metrics[group]
-                tier_rows.append({
-                    "Tier": group,
-                    "Conversion": f"{m['conversion_rate']:.0f}%",
-                    "Median days to decision": f"{m['median_days_to_decision']:.0f}",
-                    "Median lead time (days)": f"{m['median_lead_days']:.0f}",
-                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
-                    "Total inquiries": m["count"],
-                })
-            st.dataframe(pd.DataFrame(tier_rows), hide_index=True, use_container_width=True)
-        else:
-            st.info("No tier-classifiable inquiries for 2026 yet")
-
-        # ROW 13: Conversion by Recommended Status
-        st.divider()
-        st.subheader("🤝 Conversion by Recommended Status (2026)")
-        st.caption(
-            "How conversion varies based on whether BIG FUN is on the venue's "
-            "preferred-vendor list. Hypothesis: 'Yes, with hard evidence' should "
-            "outperform 'No, with hard evidence'. Empty rows mean no inquiries "
-            "from venues in that status."
-        )
-        try:
-            status_metrics = calculate_metrics_by_recommended_status(inquiry_df, tier_lookup)
-        except Exception as e:
-            status_metrics = {}
-            st.caption(f"Status calc failed: {str(e)[:100]}")
-        if status_metrics:
-            STATUS_ORDER = [
-                "Yes, with hard evidence",
-                "Yes/Likely, with no hard evidence",
-                "Unknown",
-                "Unlikely",
-                "No, with hard evidence",
-            ]
-            status_rows = []
-            seen = set()
-            for s in STATUS_ORDER:
-                if s in status_metrics:
-                    m = status_metrics[s]
-                    status_rows.append({
-                        "Recommended Status": s,
-                        "Conversion": f"{m['conversion_rate']:.0f}%",
-                        "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
-                        "Total inquiries": m["count"],
-                    })
-                    seen.add(s)
-            # Surface anything we didn't expect (defensive)
-            for s, m in status_metrics.items():
-                if s in seen:
-                    continue
-                status_rows.append({
-                    "Recommended Status": s or "(blank)",
-                    "Conversion": f"{m['conversion_rate']:.0f}%",
-                    "Booked / Eligible": f"{m['booked']}/{m['eligible']}",
-                    "Total inquiries": m["count"],
-                })
-            st.dataframe(pd.DataFrame(status_rows), hide_index=True, use_container_width=True)
-        else:
-            st.info("No status-classifiable inquiries for 2026 yet")
-
-        # ROW 14: Action lists — Research / Outreach / Growth Targets
-        st.divider()
-        st.subheader("🎯 Action lists")
-        action_col1, action_col2 = st.columns(2)
-
-        with action_col1:
-            st.markdown("**🔍 Research Targets**")
-            st.caption(
-                "Tier 1/2 venues where we don't know whether we're on their preferred list. "
-                "Sorted by 2026 inquiry volume — chase the ones sending us business first."
-            )
-            try:
-                research = find_research_targets(venues, tier_lookup, inquiry_df)
-            except Exception as e:
-                research = []
-                st.caption(f"Research-targets calc failed: {str(e)[:100]}")
-            if research:
-                research_rows = [
-                    {
-                        "Venue": t["name"][:40],
-                        "Tier": t["tier"],
-                        "Inquiries (2026)": t["inquiries_this_year"],
-                    }
-                    for t in research
-                ]
-                st.dataframe(pd.DataFrame(research_rows), hide_index=True, use_container_width=True)
-            else:
-                st.info("All Tier 1/2 venues have a known preferred-list status")
-
-        with action_col2:
-            st.markdown("**📤 Outreach Targets**")
-            st.caption(
-                "Growth-target venues we've confirmed we're not on the preferred list for. "
-                "Highest-priority outreach — declared intent + known gap."
-            )
-            try:
-                outreach = find_outreach_targets(venues, tier_lookup, inquiry_df)
-            except Exception as e:
-                outreach = []
-                st.caption(f"Outreach-targets calc failed: {str(e)[:100]}")
-            if outreach:
-                outreach_rows = [
-                    {
-                        "Venue": t["name"][:35],
-                        "Tier": t["tier"],
-                        "Status": t["recommended_status"],
-                        "Inquiries (2026)": t["inquiries_this_year"],
-                    }
-                    for t in outreach
-                ]
-                st.dataframe(pd.DataFrame(outreach_rows), hide_index=True, use_container_width=True)
-            else:
-                st.info("No outreach targets — fill in Recommended Status for growth-target venues")
-
-        # Growth Target activity (full width)
-        st.markdown("**🌱 Growth Target Activity**")
-        st.caption(
-            "Recent inquiry and booking counts for every venue you've flagged as a growth target. "
-            "If a flagged venue isn't generating inquiries over time, the bet isn't paying off."
-        )
-        try:
-            gt_activity = calculate_growth_target_activity(venues, tier_lookup, inquiry_df)
-        except Exception as e:
-            gt_activity = []
-            st.caption(f"Growth-target calc failed: {str(e)[:100]}")
-        if gt_activity:
-            gt_rows = [
-                {
-                    "Venue": v["name"][:45],
-                    "Tier": v["tier"],
-                    "Status": v["recommended_status"],
-                    "2026 Inquiries": v["inquiries"],
-                    "2026 Booked": v["booked"],
-                }
-                for v in gt_activity
-            ]
-            st.dataframe(pd.DataFrame(gt_rows), hide_index=True, use_container_width=True)
-        else:
-            st.info("No growth-target venues flagged. Check the Airtable Venues table.")
-    elif inquiry_df is not None:
-        st.divider()
-        st.caption(
-            "Venue tier sections require an Airtable Personal Access Token. "
-            "Add it to Streamlit secrets as `airtable_pat`, or to macOS Keychain via "
-            "`security add-generic-password -s bigfun-airtable-pat -a paul -w <PAT> -U` for local dev."
-        )
-
     # ==========================================================================
     # Footer
     # ==========================================================================

@@ -4,12 +4,29 @@ A read-only status board showing booking pace, lead metrics, and upcoming events
 
 ## What It Shows
 
-- **Booking Pace**: 2026 vs 2025 year-over-year comparison
-- **Lead Metrics**: Total inquiries, booked, didn't book, turn-aways
-- **Conversion Rates**: Overall and by lead source
-- **Upcoming Events**: Next 14 days from FileMaker gig database
-- **Lead Time Analysis**: How far ahead people inquire, by outcome
-- **Interaction Analysis**: Conversion rates by engagement level (email vs phone)
+Sections are grouped Sales → Capacity → Venues → Operations.
+
+**Sales**
+- **Booking Pace**: current vs prior year comparison (YTD weekly + last-30-days daily charts)
+- **Inquiries Summary**: total, booked (with cancellation context), didn't book, full/turn-away, cold
+- **Conversion**: overall rate plus by lead source and by interaction level. One definition everywhere: capacity outcomes (Full / We turn down), cold ghosts (never confirmed receipt of the initial email), and venue handoffs (AAG-style, no client decision) are excluded
+- **Lead Time Analysis**: lead time and days-to-decision by outcome
+- **Conversion by Lead Time at Inquiry**: conversion + decision speed per lead-time bucket
+- **Decision Velocity by Lead Source**: how fast each source decides
+- **Decision Curves**: % still undecided at day N, overall and split by lead-time bucket (feeds stale-lead thresholds)
+
+**Capacity**
+- **Capacity Reality**: Full events split into True Capacity vs Artificial Cap, with declined-revenue estimate
+
+**Venues** (requires Airtable PAT)
+- **Conversion by Venue Tier** and **by Recommended Status**
+- **Action lists**: research targets, outreach targets, growth-target activity
+
+**Operations**
+- **Upcoming Events**: next 14 days from FileMaker gig database
+- **Events Booked by DJ**: per-DJ assignment counts + true event count
+
+The event year is set once at the top of `dashboard.py` (`EVENT_YEAR`) — bump it each January.
 
 ## Data Sources
 
@@ -18,6 +35,7 @@ A read-only status board showing booking pace, lead metrics, and upcoming events
 | Booking Snapshots Sheet | YoY booking pace comparison |
 | Inquiry Tracker Sheet | Lead metrics, conversion, lead time |
 | FileMaker Gig Database | Upcoming events with venue/DJ details |
+| Airtable Venues table | Venue tiers, recommended status, growth targets |
 
 ## Local Development
 
@@ -95,13 +113,11 @@ INQUIRY_TRACKER_SHEET_ID = "1ng-OytB9LJ8Fmfazju4cfFJRRa6bqfRIZA8GYEWhJRs"
 
 ## Caching
 
-Data is cached for 5 minutes to reduce API calls. Click the 🔄 button to force a refresh.
+Data is cached for 1 hour to reduce API calls. Click the 🔄 button to force a refresh.
 
 ## Future Enhancements
 
-- [ ] Capacity snapshot from Availability Matrix
 - [ ] Fully booked dates list
-- [ ] DJ workload distribution
 - [ ] Auto-refresh on timer
 - [ ] Mobile-optimized layout
 

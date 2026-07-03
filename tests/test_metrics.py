@@ -17,8 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dashboard import (  # noqa: E402
     AVG_DEAL_SIZE,
+    EVENT_YEAR,
     LEAD_TIME_BUCKETS,
     _bucket_lead_time,
+    _is_aag_handoff,
+    calculate_lead_metrics,
     build_venue_tier_lookup,
     calculate_days_to_decision_by_source,
     calculate_full_reasons,
@@ -28,7 +31,6 @@ from dashboard import (  # noqa: E402
     calculate_metrics_by_tier,
     calculate_survival_curve,
     calculate_survival_curve_by_lead_time,
-    calculate_velocity_weekly,
     find_outreach_targets,
     find_research_targets,
     normalize_venue_name,
@@ -159,93 +161,6 @@ def test_dtd_by_source_handles_no_bookings_for_source():
     out = calculate_days_to_decision_by_source(df, event_year=2026, min_count=3)
     assert out["Knot"]["booked_count"] == 0
     assert out["Knot"]["median_days_booked"] is None
-
-
-# -- calculate_velocity_weekly ---------------------------------------------
-
-def test_velocity_returns_requested_week_count():
-    today = datetime.now()
-    rows = []
-    for i in range(15):
-        decision = today - timedelta(days=3 + i * 4)
-        inquiry = decision - timedelta(days=5)
-        rows.append({
-            "Event Date": "12/15/26",
-            "Inquiry Date": inquiry.strftime("%Y-%m-%d"),
-            "Decision Date": decision.strftime("%Y-%m-%d"),
-            "Resolution": "Booked" if i < 10 else "Didn't Book",
-            "Initial Contact": "Email",
-            "Venue (if known)": "",
-            "Level of interaction": "",
-        })
-    df = pd.DataFrame(rows)
-    out = calculate_velocity_weekly(df, weeks=4, window_weeks=8)
-
-    assert len(out) == 4
-    latest = out[-1]
-    assert latest["opps"] > 0
-    assert latest["velocity_dollars_per_day"] > 0
-    assert 0 < latest["win_rate_pct"] <= 100
-
-
-def test_velocity_formula_matches_definition():
-    """Sanity: velocity = opps × deal × win_rate / cycle, on a hand-computed window."""
-    today = datetime.now()
-    rows = []
-    # 4 booked at 7-day cycle, 1 lost at 7-day cycle, all in last week
-    for i in range(5):
-        decision = today - timedelta(days=2)
-        inquiry = decision - timedelta(days=7)
-        rows.append({
-            "Event Date": "12/15/26",
-            "Inquiry Date": inquiry.strftime("%Y-%m-%d"),
-            "Decision Date": decision.strftime("%Y-%m-%d"),
-            "Resolution": "Booked" if i < 4 else "Didn't Book",
-            "Initial Contact": "Email",
-            "Venue (if known)": "",
-            "Level of interaction": "",
-        })
-    df = pd.DataFrame(rows)
-    out = calculate_velocity_weekly(df, weeks=1, window_weeks=8)
-
-    assert len(out) == 1
-    w = out[-1]
-    assert w["opps"] == 5
-    assert w["booked"] == 4
-    assert abs(w["win_rate_pct"] - 80) < 0.001
-    assert abs(w["avg_cycle_days"] - 7) < 0.001
-    expected = (5 * AVG_DEAL_SIZE * 0.8) / 7
-    assert abs(w["velocity_dollars_per_day"] - expected) < 0.01
-
-
-def test_velocity_excludes_capacity_outcomes_from_denominator():
-    today = datetime.now()
-    decision = today - timedelta(days=2)
-    inquiry = decision - timedelta(days=7)
-    rows = [
-        {
-            "Event Date": "12/15/26",
-            "Inquiry Date": inquiry.strftime("%Y-%m-%d"),
-            "Decision Date": decision.strftime("%Y-%m-%d"),
-            "Resolution": res,
-            "Initial Contact": "Email",
-            "Venue (if known)": "",
-            "Level of interaction": "",
-        }
-        for res in ["Booked", "Full", "We turn down"]
-    ]
-    df = pd.DataFrame(rows)
-    out = calculate_velocity_weekly(df, weeks=1, window_weeks=8)
-    w = out[-1]
-    # Full + Turn down excluded → only the Booked counts as an opp
-    assert w["opps"] == 1
-    assert w["booked"] == 1
-    assert w["win_rate_pct"] == 100
-
-
-def test_velocity_handles_empty_df():
-    df = pd.DataFrame(columns=["Inquiry Date", "Decision Date", "Resolution"])
-    assert calculate_velocity_weekly(df) == []
 
 
 # -- calculate_survival_curve ----------------------------------------------
@@ -379,20 +294,6 @@ def test_aag_handoffs_excluded_from_survival_curve_by_lead_time():
     assert out["<3 mo"][0]["n_total"] == 1
 
 
-def test_aag_handoffs_excluded_from_velocity():
-    today = pd.Timestamp.now().normalize()
-    rows = [
-        # 2 real bookings
-        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=5)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Knot", "Venue (if known)": "Nestldown", "Level of interaction": "Meaningful email interaction"},
-        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=4)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Knot", "Venue (if known)": "Nestldown", "Level of interaction": "Meaningful email interaction"},
-        # AAG handoff (excluded)
-        {"Event Date": "12/15/26", "Inquiry Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Decision Date": (today - pd.Timedelta(days=10)).strftime("%Y-%m-%d"), "Resolution": "Booked", "Initial Contact": "Venue", "Venue (if known)": "Allied Arts Guild", "Level of interaction": "Never acknowledged"},
-    ]
-    df = pd.DataFrame(rows)
-    out = calculate_velocity_weekly(df, weeks=1, window_weeks=4)
-    assert out[-1]["opps"] == 2  # AAG handoff excluded
-
-
 def test_aag_handoffs_excluded_from_metrics_by_tier():
     venues = [_venue("Nestldown", tier="Tier 1"), _venue("Allied Arts Guild", tier="Tier 1")]
     lookup = build_venue_tier_lookup(venues)
@@ -402,6 +303,98 @@ def test_aag_handoffs_excluded_from_metrics_by_tier():
     ])
     out = calculate_metrics_by_tier(df, lookup, event_year=2026)
     assert out["Tier 1"]["count"] == 1  # AAG handoff filtered
+
+
+def test_cold_ghost_excluded_from_buckets():
+    df = pd.DataFrame([
+        _row("12/15/26", "2026-11-15", "2026-11-20", "Booked"),
+        # Ghost: cold, never confirmed receipt of the initial email — excluded
+        {**_row("12/16/26", "2026-11-15", "2026-11-30", "Cold"),
+         "Level of interaction": "Never acknowledged"},
+        # Cold after engagement — stays in
+        _row("12/17/26", "2026-11-15", "2026-11-30", "Cold"),
+    ])
+    out = calculate_lead_time_buckets(df, event_year=2026)
+    bucket = out["<3 mo"]
+    assert bucket["count"] == 2  # ghost gone entirely
+    assert bucket["eligible"] == 2
+    assert bucket["booked"] == 1
+
+
+def test_cold_ghost_excluded_from_survival_lost_cohort():
+    df = pd.DataFrame([
+        _row("12/15/26", "2026-11-01", "2026-11-05", "Booked"),
+        {**_row("12/15/26", "2026-11-01", "2026-11-30", "Cold"),
+         "Level of interaction": "Never acknowledged"},  # ghost, excluded
+        _row("12/15/26", "2026-11-01", "2026-12-01", "Didn't Book"),
+    ])
+    out = calculate_survival_curve(df, event_year=2026, max_days=60)
+    assert out["Lost"][-1]["n_total"] == 1  # only the engaged loss
+
+
+def test_handoff_new_form_value_any_venue():
+    # "Venue - handoff" Initial Contact marks a handoff regardless of venue
+    # or interaction level.
+    row = {"Initial Contact": "Venue - handoff", "Venue (if known)": "Little Hills",
+           "Level of interaction": "Only acknowledged"}
+    assert _is_aag_handoff(row) is True
+
+
+def test_handoff_legacy_requires_aag_venue():
+    base = {"Initial Contact": "Venue", "Level of interaction": "Never acknowledged"}
+    assert _is_aag_handoff({**base, "Venue (if known)": "Allied Arts Guild"}) is True
+    # Tracker contains this misspelling; must still count as AAG
+    assert _is_aag_handoff({**base, "Venue (if known)": "Alled Arts Guild"}) is True
+    # Venue-mediated sale at another venue: the client can still decline,
+    # so it stays in the sales metrics.
+    assert _is_aag_handoff({**base, "Venue (if known)": "Little Hills"}) is False
+
+
+def test_handoff_legacy_requires_never_acknowledged():
+    row = {"Initial Contact": "Venue", "Venue (if known)": "Allied Arts Guild",
+           "Level of interaction": "Meaningful email interaction"}
+    assert _is_aag_handoff(row) is False
+
+
+def test_venue_mediated_sale_included_in_lead_time_buckets():
+    df = pd.DataFrame([
+        _aag_handoff_row("12/15/26", "2026-11-15", "2026-11-15"),           # excluded
+        _aag_handoff_row("12/16/26", "2026-11-16", "2026-11-16", venue="Little Hills"),  # real sale, included
+    ])
+    out = calculate_lead_time_buckets(df, event_year=2026)
+    total = sum(b["count"] for b in out.values())
+    assert total == 1
+
+
+# -- calculate_lead_metrics (handoff exclusions) ------------------------------
+
+def test_lead_metrics_conversion_excludes_handoffs():
+    yy = EVENT_YEAR % 100
+    df = pd.DataFrame([
+        _row(f"12/15/{yy}", f"11/1/{EVENT_YEAR}", f"11/5/{EVENT_YEAR}", "Booked"),
+        _row(f"12/16/{yy}", f"11/1/{EVENT_YEAR}", f"11/5/{EVENT_YEAR}", "Didn't Book"),
+        _aag_handoff_row(f"12/17/{yy}", f"11/1/{EVENT_YEAR}", f"11/1/{EVENT_YEAR}"),
+    ])
+    metrics = calculate_lead_metrics(df)
+    # Raw booked count keeps the handoff (it's a real event)
+    assert metrics["booked"] == 2
+    # Conversion treats only the sales rows: 1 booked / 2 eligible
+    assert abs(metrics["conversion_rate"] - 50.0) < 0.001
+    assert metrics["aag_house_bookings"] == 1
+
+
+def test_lead_metrics_by_source_excludes_handoffs():
+    yy = EVENT_YEAR % 100
+    df = pd.DataFrame([
+        _row(f"12/15/{yy}", f"11/1/{EVENT_YEAR}", f"11/5/{EVENT_YEAR}", "Booked", source="Client direct"),
+        _aag_handoff_row(f"12/17/{yy}", f"11/1/{EVENT_YEAR}", f"11/1/{EVENT_YEAR}"),
+        {**_aag_handoff_row(f"12/18/{yy}", f"11/2/{EVENT_YEAR}", f"11/2/{EVENT_YEAR}", venue="Mountain Terrace"),
+         "Initial Contact": "Venue - handoff"},
+    ])
+    metrics = calculate_lead_metrics(df)
+    assert "Client direct" in metrics["by_source"]
+    assert "Venue" not in metrics["by_source"]
+    assert "Venue - handoff" not in metrics["by_source"]
 
 
 def test_survival_by_lead_time_handles_empty_df():
@@ -746,3 +739,99 @@ def test_lead_time_buckets_constant_is_ordered():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -- dedupe_inquiries --------------------------------------------------------
+
+from dashboard import dedupe_inquiries  # noqa: E402
+
+
+def _tracker_row(ts, event_date, venue, resolution):
+    return {
+        "Timestamp": ts,
+        "Event Date": event_date,
+        "Venue (if known)": venue,
+        "Resolution": resolution,
+    }
+
+
+def test_dedup_booked_then_canceled_nets_to_canceled():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Nestldown", "Booked"),
+        _tracker_row("2/1/2026 10:00:00", "9/5/2026", "Nestldown", "Canceled"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
+    assert out.iloc[0]["Resolution"] == "Canceled"
+
+
+def test_dedup_cancel_before_booking_does_not_count():
+    # A Canceled row timestamped BEFORE the booking doesn't cancel it
+    df = pd.DataFrame([
+        _tracker_row("2/1/2026 10:00:00", "9/5/2026", "Nestldown", "Booked"),
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Nestldown", "Canceled"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
+    assert out.iloc[0]["Resolution"] == "Booked"
+
+
+def test_dedup_multiple_booked_are_separate_clients():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Allied Arts Guild", "Booked"),
+        _tracker_row("1/2/2026 10:00:00", "9/5/2026", "Allied Arts Guild", "Booked"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 2
+
+
+def test_dedup_one_cancel_removes_one_of_two_bookings():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Allied Arts Guild", "Booked"),
+        _tracker_row("1/2/2026 10:00:00", "9/5/2026", "Allied Arts Guild", "Booked"),
+        _tracker_row("3/1/2026 10:00:00", "9/5/2026", "Allied Arts Guild", "Canceled"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
+    assert out.iloc[0]["Resolution"] == "Booked"
+
+
+def test_dedup_non_booked_keeps_newest():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Nestldown", "Cold"),
+        _tracker_row("2/1/2026 10:00:00", "9/5/2026", "Nestldown", "Didn't Book"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
+    assert out.iloc[0]["Resolution"] == "Didn't Book"
+
+
+def test_dedup_venue_casing_pairs_up():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "el Prado", "Booked"),
+        _tracker_row("2/1/2026 10:00:00", "9/5/2026", "el PRADO", "Canceled"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
+    assert out.iloc[0]["Resolution"] == "Canceled"
+
+
+def test_dedup_different_venues_same_date_kept_separately():
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "Nestldown", "Booked"),
+        _tracker_row("1/2/2026 10:00:00", "9/5/2026", "Kohl Mansion", "Didn't Book"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 2
+
+
+def test_dedup_blank_venue_same_date_collapses_known_limit():
+    # Documented limitation: two no-venue inquiries for the same date share a
+    # key and collapse to the newest. If this starts to matter, the fix is a
+    # client-name field on the form.
+    df = pd.DataFrame([
+        _tracker_row("1/1/2026 10:00:00", "9/5/2026", "", "Cold"),
+        _tracker_row("2/1/2026 10:00:00", "9/5/2026", "", "Didn't Book"),
+    ])
+    out = dedupe_inquiries(df)
+    assert len(out) == 1
