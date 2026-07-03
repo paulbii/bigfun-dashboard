@@ -1872,10 +1872,64 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # SALES
+    # TODAY — glance and go
     # ==========================================================================
 
-    st.header("📈 Sales")
+    st.header("📌 Today")
+
+    # ==========================================================================
+    # TODAY: Upcoming Events
+    # ==========================================================================
+    
+    st.subheader("📅 Upcoming Events (Next 14 Days)")
+    
+    try:
+        events = get_upcoming_events(14)
+        
+        if events:
+            # Group by date
+            events_by_date = {}
+            for event in events:
+                date = event.get("event_date", "Unknown")
+                if date not in events_by_date:
+                    events_by_date[date] = []
+                events_by_date[date].append(event)
+            
+            # Display in columns
+            cols = st.columns(min(len(events_by_date), 4))
+            
+            for idx, (date, day_events) in enumerate(sorted(events_by_date.items())):
+                col_idx = idx % 4
+                with cols[col_idx]:
+                    # Format date
+                    try:
+                        dt = datetime.strptime(date, "%Y-%m-%d")
+                        formatted_date = f"{dt.strftime('%a %b')} {dt.day}"  # "Sat Feb 3"
+                    except ValueError:
+                        formatted_date = date
+                    
+                    st.markdown(f"**{formatted_date}**")
+                    
+                    for event in day_events:
+                        dj = event.get("assigned_dj", "TBA")
+                        initials = get_dj_initials(dj)
+                        venue = event.get("venue_name", "Unknown venue")
+                        # Truncate venue name
+                        if len(venue) > 20:
+                            venue = venue[:17] + "..."
+
+                        label = f"[{initials}] {venue}"
+                        if is_setup_event(event):
+                            label += " (Setup)"
+                        st.text(label)
+                    st.text("")  # Spacer
+        else:
+            st.info("No upcoming events found")
+    except Exception as e:
+        st.error(f"Could not load upcoming events: {e}")
+    
+    st.divider()
+    
 
     
     # Pre-calculate metrics for use across sections
@@ -1986,7 +2040,84 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # SALES: Conversion (all metrics)
+    # TODAY: DJ Bookings by Person
+    # ==========================================================================
+    
+    st.subheader(f"🎧 Events Booked by DJ ({EVENT_YEAR})")
+    
+    try:
+        dj_counts = get_dj_booking_counts(EVENT_YEAR)
+        
+        if dj_counts:
+            # Separate TBA from assigned DJs
+            tba_count = dj_counts.pop("TBA", 0)
+            assigned_total = sum(dj_counts.values())
+
+            # True event count from the gig db (one record = one event, so a
+            # co-DJ event counts once), excluding setups. Distinct from the
+            # per-DJ tallies below, which are assignments and sum higher whenever
+            # an event has more than one DJ.
+            events, setups = get_event_count(EVENT_YEAR)
+            if events is not None:
+                ev_label = f"Events ({EVENT_YEAR}){f' — {setups} setup(s) excluded' if setups else ''}"
+                st.metric(ev_label, events)
+
+            # Sort assigned DJs by count descending
+            sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
+            cols = st.columns(len(sorted_djs))
+            for idx, (dj_name, count) in enumerate(sorted_djs):
+                with cols[idx]:
+                    st.metric(label=dj_name, value=count)
+
+            if events is not None:
+                st.caption(
+                    f"Per-DJ numbers are assignments (a co-DJ event is credited to both DJs): "
+                    f"{assigned_total} assignments across {events} events. "
+                    f"Unassigned (TBA): {tba_count}."
+                )
+            else:
+                st.caption(f"DJ assignments: {assigned_total} • Unassigned (TBA): {tba_count}")
+        else:
+            st.info("No booking data available")
+    except Exception as e:
+        st.error(f"Could not load DJ bookings: {str(e)[:100]}")
+    
+    st.divider()
+    
+
+    # ==========================================================================
+    # WATCH — trends reviewed weekly
+    # ==========================================================================
+
+    st.header("📈 Watch")
+
+    # ==========================================================================
+    # WATCH: Booking Pace Charts
+    # ==========================================================================
+    
+    # Booking Pace Charts
+    try:
+        if yoy_df is not None and not yoy_df.empty:
+            chart_col1, chart_col2 = st.columns(2)
+            
+            with chart_col1:
+                st.caption("**Year to Date (weekly)**")
+                ytd_chart = create_booking_pace_chart_ytd(yoy_df)
+                if ytd_chart:
+                    st.plotly_chart(ytd_chart, use_container_width=True)
+            
+            with chart_col2:
+                st.caption("**Last 30 Days (daily)**")
+                daily_chart = create_booking_pace_chart(yoy_df, days=30)
+                if daily_chart:
+                    st.plotly_chart(daily_chart, use_container_width=True)
+    except Exception as e:
+        st.caption(f"Could not load pace charts: {str(e)[:50]}")
+    
+    st.divider()
+    
+    # ==========================================================================
+    # WATCH: Conversion (all metrics)
     # ==========================================================================
     
     st.subheader("🎯 Conversion")
@@ -2060,32 +2191,7 @@ def main():
     st.divider()
     
     # ==========================================================================
-    # SALES: Booking Pace Charts
-    # ==========================================================================
-    
-    # Booking Pace Charts
-    try:
-        if yoy_df is not None and not yoy_df.empty:
-            chart_col1, chart_col2 = st.columns(2)
-            
-            with chart_col1:
-                st.caption("**Year to Date (weekly)**")
-                ytd_chart = create_booking_pace_chart_ytd(yoy_df)
-                if ytd_chart:
-                    st.plotly_chart(ytd_chart, use_container_width=True)
-            
-            with chart_col2:
-                st.caption("**Last 30 Days (daily)**")
-                daily_chart = create_booking_pace_chart(yoy_df, days=30)
-                if daily_chart:
-                    st.plotly_chart(daily_chart, use_container_width=True)
-    except Exception as e:
-        st.caption(f"Could not load pace charts: {str(e)[:50]}")
-    
-    st.divider()
-    
-    # ==========================================================================
-    # SALES: Lead Time Analysis
+    # WATCH: Lead Time Analysis
     # ==========================================================================
     
     st.subheader(f"⏱️ Lead Time Analysis ({EVENT_YEAR})")
@@ -2133,7 +2239,7 @@ def main():
         st.info("Lead time data requires both Inquiry Date and Decision Date fields")
 
     # ==========================================================================
-    # SALES: Conversion by Lead Time at Inquiry
+    # WATCH: Conversion by Lead Time at Inquiry
     # ==========================================================================
 
     st.divider()
@@ -2180,7 +2286,7 @@ def main():
         st.info("No lead-time bucket data available")
 
     # ==========================================================================
-    # SALES: Days to Decision by Lead Source
+    # WATCH: Days to Decision by Lead Source
     # ==========================================================================
 
     st.divider()
@@ -2225,10 +2331,16 @@ def main():
         st.info("No source data available")
 
     # ==========================================================================
-    # SALES: Survival / Decision Curve
+    # REFERENCE & ACTION — consult when doing specific work
     # ==========================================================================
 
     st.divider()
+    st.header("🗂️ Reference & Action")
+
+    # ==========================================================================
+    # REFERENCE: Survival / Decision Curve
+    # ==========================================================================
+
     st.subheader(f"📉 Decision Curve ({EVENT_YEAR})")
     st.caption(
         "Of couples who eventually booked or were lost, what % were still undecided "
@@ -2249,7 +2361,7 @@ def main():
     else:
         st.info("No survival data available")
 
-    # SALES: Decision Curve faceted by lead-time-at-inquiry bucket.
+    # REFERENCE: Decision Curve faceted by lead-time-at-inquiry bucket.
     # Used for setting bucket-specific stale-lead thresholds in MailMaven.
     st.divider()
     st.subheader(f"📉 Decision Curve by Lead Time ({EVENT_YEAR} bookers)")
@@ -2276,12 +2388,11 @@ def main():
         st.info("No bucket-faceted survival data available")
 
     # ==========================================================================
-    # CAPACITY
+    # REFERENCE: Capacity Reality (Full reasons)
     # ==========================================================================
 
     st.divider()
-    st.header("🏗️ Capacity")
-    st.subheader(f"Capacity Reality ({EVENT_YEAR})")
+    st.subheader(f"🏗️ Capacity Reality ({EVENT_YEAR})")
     st.caption(
         "Splits Full events into True Capacity (we genuinely had no DJ available) "
         "vs Artificial Cap (we declined the date despite having capacity, including "
@@ -2324,7 +2435,7 @@ def main():
         st.info(f"No {EVENT_YEAR} Full events to analyze yet")
 
     # ==========================================================================
-    # VENUES: tier slicing + action lists (reads Airtable Venues table)
+    # REFERENCE: venue tier slicing + action lists (reads Airtable Venues table)
     # ==========================================================================
 
     venues = []
@@ -2337,8 +2448,7 @@ def main():
 
     if venues and inquiry_df is not None and not inquiry_df.empty:
         st.divider()
-        st.header("🏛️ Venues")
-        st.subheader(f"Conversion by Venue Tier ({EVENT_YEAR})")
+        st.subheader(f"🏛️ Conversion by Venue Tier ({EVENT_YEAR})")
         excluded_count = sum(1 for v in venues if not v.get("wedding_venue", True))
         if excluded_count > 0:
             st.caption(
@@ -2376,7 +2486,7 @@ def main():
         else:
             st.info(f"No tier-classifiable inquiries for {EVENT_YEAR} yet")
 
-        # VENUES: Conversion by Recommended Status
+        # REFERENCE: Conversion by Recommended Status
         st.divider()
         st.subheader(f"🤝 Conversion by Recommended Status ({EVENT_YEAR})")
         st.caption(
@@ -2424,7 +2534,7 @@ def main():
         else:
             st.info(f"No status-classifiable inquiries for {EVENT_YEAR} yet")
 
-        # VENUES: Action lists — Research / Outreach / Growth Targets
+        # ACTION: Action lists — Research / Outreach / Growth Targets
         st.divider()
         st.subheader("🎯 Action lists")
         action_col1, action_col2 = st.columns(2)
@@ -2511,111 +2621,6 @@ def main():
             "`security add-generic-password -s bigfun-airtable-pat -a paul -w <PAT> -U` for local dev."
         )
 
-    # ==========================================================================
-    # OPERATIONS
-    # ==========================================================================
-
-    st.divider()
-    st.header("🎧 Operations")
-
-    # ==========================================================================
-    # OPERATIONS: Upcoming Events
-    # ==========================================================================
-    
-    st.subheader("📅 Upcoming Events (Next 14 Days)")
-    
-    try:
-        events = get_upcoming_events(14)
-        
-        if events:
-            # Group by date
-            events_by_date = {}
-            for event in events:
-                date = event.get("event_date", "Unknown")
-                if date not in events_by_date:
-                    events_by_date[date] = []
-                events_by_date[date].append(event)
-            
-            # Display in columns
-            cols = st.columns(min(len(events_by_date), 4))
-            
-            for idx, (date, day_events) in enumerate(sorted(events_by_date.items())):
-                col_idx = idx % 4
-                with cols[col_idx]:
-                    # Format date
-                    try:
-                        dt = datetime.strptime(date, "%Y-%m-%d")
-                        formatted_date = f"{dt.strftime('%a %b')} {dt.day}"  # "Sat Feb 3"
-                    except ValueError:
-                        formatted_date = date
-                    
-                    st.markdown(f"**{formatted_date}**")
-                    
-                    for event in day_events:
-                        dj = event.get("assigned_dj", "TBA")
-                        initials = get_dj_initials(dj)
-                        venue = event.get("venue_name", "Unknown venue")
-                        # Truncate venue name
-                        if len(venue) > 20:
-                            venue = venue[:17] + "..."
-
-                        label = f"[{initials}] {venue}"
-                        if is_setup_event(event):
-                            label += " (Setup)"
-                        st.text(label)
-                    st.text("")  # Spacer
-        else:
-            st.info("No upcoming events found")
-    except Exception as e:
-        st.error(f"Could not load upcoming events: {e}")
-    
-    st.divider()
-    
-    # ==========================================================================
-    # OPERATIONS: DJ Bookings by Person
-    # ==========================================================================
-    
-    st.subheader(f"🎧 Events Booked by DJ ({EVENT_YEAR})")
-    
-    try:
-        dj_counts = get_dj_booking_counts(EVENT_YEAR)
-        
-        if dj_counts:
-            # Separate TBA from assigned DJs
-            tba_count = dj_counts.pop("TBA", 0)
-            assigned_total = sum(dj_counts.values())
-
-            # True event count from the gig db (one record = one event, so a
-            # co-DJ event counts once), excluding setups. Distinct from the
-            # per-DJ tallies below, which are assignments and sum higher whenever
-            # an event has more than one DJ.
-            events, setups = get_event_count(EVENT_YEAR)
-            if events is not None:
-                ev_label = f"Events ({EVENT_YEAR}){f' — {setups} setup(s) excluded' if setups else ''}"
-                st.metric(ev_label, events)
-
-            # Sort assigned DJs by count descending
-            sorted_djs = sorted(dj_counts.items(), key=lambda x: -x[1])
-            cols = st.columns(len(sorted_djs))
-            for idx, (dj_name, count) in enumerate(sorted_djs):
-                with cols[idx]:
-                    st.metric(label=dj_name, value=count)
-
-            if events is not None:
-                st.caption(
-                    f"Per-DJ numbers are assignments (a co-DJ event is credited to both DJs): "
-                    f"{assigned_total} assignments across {events} events. "
-                    f"Unassigned (TBA): {tba_count}."
-                )
-            else:
-                st.caption(f"DJ assignments: {assigned_total} • Unassigned (TBA): {tba_count}")
-        else:
-            st.info("No booking data available")
-    except Exception as e:
-        st.error(f"Could not load DJ bookings: {str(e)[:100]}")
-    
-    st.divider()
-    
     # ==========================================================================
     # Footer
     # ==========================================================================
