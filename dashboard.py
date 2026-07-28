@@ -4,6 +4,7 @@ A read-only status board showing booking pace, lead metrics, and capacity.
 """
 
 import re
+import time
 from datetime import datetime, timedelta
 
 import gspread
@@ -84,6 +85,27 @@ def get_google_client():
     return gspread.authorize(creds)
 
 
+_TRANSIENT_API_CODES = {429, 500, 502, 503, 504}
+
+
+def open_spreadsheet_with_retry(client, spreadsheet_id, max_attempts=3):
+    # Streamlit Cloud cold starts occasionally land on a brief Google API
+    # blip. Retry only on transient codes; permission (403) and not-found
+    # (404) propagate immediately, since retrying those just adds latency to
+    # the same failure.
+    #
+    # Ported from dj-availability-checker/dj_core.py, which had this and the
+    # dashboard did not. Keep the two in step if either changes.
+    for attempt in range(max_attempts):
+        try:
+            return client.open_by_key(spreadsheet_id)
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            if status not in _TRANSIENT_API_CODES or attempt == max_attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+
 # =============================================================================
 # DATA FETCHING
 # =============================================================================
@@ -149,7 +171,7 @@ def get_venue_tiers_from_airtable():
 def get_year_comparison_data():
     """Fetch YoY booking comparison from Booking Snapshots sheet."""
     client = get_google_client()
-    sheet = client.open_by_key(BOOKING_SNAPSHOTS_SHEET_ID)
+    sheet = open_spreadsheet_with_retry(client, BOOKING_SNAPSHOTS_SHEET_ID)
     worksheet = sheet.worksheet("Year Comparison")
     
     # Use get_all_values() to handle any header weirdness
@@ -230,7 +252,7 @@ def dedupe_inquiries(df):
 def get_inquiry_tracker_data():
     """Fetch all inquiry data from the Inquiry Tracker sheet."""
     client = get_google_client()
-    sheet = client.open_by_key(INQUIRY_TRACKER_SHEET_ID)
+    sheet = open_spreadsheet_with_retry(client, INQUIRY_TRACKER_SHEET_ID)
     # Read the raw form source, not the derived "Master View" tab.
     # Master View is an array formula; gspread returns empty for some spilled cells.
     worksheet = sheet.worksheet("Form Responses 1")
@@ -310,7 +332,7 @@ def get_inquiry_tracker_data():
 def get_dj_booking_counts(year=EVENT_YEAR):
     """Count BOOKED events per DJ from the Availability Matrix (year tab)."""
     client = get_google_client()
-    sheet = client.open_by_key(AVAILABILITY_MATRIX_SHEET_ID)
+    sheet = open_spreadsheet_with_retry(client, AVAILABILITY_MATRIX_SHEET_ID)
     
     try:
         worksheet = sheet.worksheet(str(year))
