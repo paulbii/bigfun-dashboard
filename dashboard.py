@@ -328,6 +328,31 @@ def get_inquiry_tracker_data():
     return df
 
 
+def _matrix_cell_events(cell_value, aag_couple=""):
+    """Events one DJ cell represents.
+
+    "BOOKED, BACKUP" (e.g., Woody at Nestldown for a morning gig + evening backup)
+    and "WEDFAIRE" (wedding fair) count as one; "BOOKED x 2" is two events that
+    day (same rule as the TBA column). RESERVED with names in the AAG couple
+    column is a DJ reserved for an Allied Arts Guild wedding not yet handed off
+    (Paul, 2026-11-11) and counts as one; RESERVED alone is a hold and does not.
+    """
+    cell_value = str(cell_value).strip().upper()
+    multi = re.match(r"BOOKED\s*X\s*(\d+)", cell_value)
+    if multi:
+        return int(multi.group(1))
+    if (
+        cell_value == "BOOKED"
+        or cell_value == "WEDFAIRE"
+        or cell_value.startswith("BOOKED,")
+        or cell_value.startswith("BOOKED ")
+    ):
+        return 1
+    if cell_value == "RESERVED" and str(aag_couple).strip():
+        return 1
+    return 0
+
+
 @st.cache_data(ttl=3600)
 def get_dj_booking_counts(year=EVENT_YEAR):
     """Count BOOKED events per DJ from the Availability Matrix (year tab)."""
@@ -343,6 +368,8 @@ def get_dj_booking_counts(year=EVENT_YEAR):
     if not all_values:
         return {}
     
+    aag_couple_col = None  # only 2027+ has an AAG couple column
+
     # Column mappings based on year (from SYSTEM_REFERENCE.md)
     # 2026: A=Date, D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, I=TBA, K=Stephanie
     # Columns are 0-indexed: D=3, E=4, F=5, G=6, H=7, I=8, K=10
@@ -367,6 +394,7 @@ def get_dj_booking_counts(year=EVENT_YEAR):
             "Felipe": 11
         }
         tba_col = 8
+        aag_couple_col = 10  # K
     else:
         # 2025: D=Henry, E=Woody, F=Paul, G=Stefano, H=Felipe, I=TBA, K=Stephanie
         dj_columns = {
@@ -379,26 +407,14 @@ def get_dj_booking_counts(year=EVENT_YEAR):
         }
         tba_col = 8
     
-    # Count BOOKED for each DJ.
-    # "BOOKED, BACKUP" (e.g., Woody at Nestldown for a morning gig + evening backup)
-    # and "WEDFAIRE" (wedding fair) both count as a booked event.
+    # Count events for each DJ (rules in _matrix_cell_events).
     counts = {}
     for dj, col_idx in dj_columns.items():
         count = 0
         for row in all_values[1:]:  # Skip header
             if col_idx < len(row):
-                cell_value = str(row[col_idx]).strip().upper()
-                # "BOOKED x 2" = two events that day (same rule as the TBA column)
-                multi = re.match(r"BOOKED\s*X\s*(\d+)", cell_value)
-                if multi:
-                    count += int(multi.group(1))
-                elif (
-                    cell_value == "BOOKED"
-                    or cell_value == "WEDFAIRE"
-                    or cell_value.startswith("BOOKED,")
-                    or cell_value.startswith("BOOKED ")
-                ):
-                    count += 1
+                couple = row[aag_couple_col] if aag_couple_col is not None and aag_couple_col < len(row) else ""
+                count += _matrix_cell_events(row[col_idx], couple)
         counts[dj] = count
     
     # Count TBA (unassigned) bookings
